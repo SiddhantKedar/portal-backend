@@ -1,0 +1,1390 @@
+# apps/influx/queries.py
+# All InfluxDB Flux queries live here.
+# Views call these functions — no Flux anywhere else in the codebase.
+# Each function returns clean Python dicts, no InfluxDB objects leak out.
+
+from datetime import datetime, timezone, timedelta
+from .client import get_influx_client
+import os
+import re
+
+INFLUX_ORG = os.getenv('INFLUX_ORG')
+
+
+# ── Timezone Helper ────────────────────────────────────────────────────────────
+
+def get_ist_midnight_utc():
+    """
+    Returns today's IST midnight as a UTC datetime string for Flux range().
+    IST = UTC+5:30, so IST midnight = UTC previous day 18:30.
+    eg: IST 2026-06-03 00:00 = UTC 2026-06-02 18:30
+    """
+    ist          = timezone(timedelta(hours=5, minutes=30))
+    now_ist      = datetime.now(ist)
+    midnight_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight_utc = midnight_ist.astimezone(timezone.utc)
+    return midnight_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def get_n_days_ago_midnight_utc(n):
+    """
+    Returns IST midnight n days ago as UTC string.
+    Used for the 7-day daily energy query.
+    """
+    ist          = timezone(timedelta(hours=5, minutes=30))
+    now_ist      = datetime.now(ist)
+    past_ist     = now_ist - timedelta(days=n)
+    midnight_ist = past_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight_utc = midnight_ist.astimezone(timezone.utc)
+    return midnight_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+# ── Overview Queries ───────────────────────────────────────────────────────────
+
+def _query_inverter_snapshot(query_api, bucket, site_id, inverter_ids):
+    """
+    Internal: fetches latest values for all inverters.
+    Returns { 'inverter1': { 'ac_active_power_kw': 35.0, ... }, ... }
+    """
+    device_filter = ' or '.join(
+        [f'r.device == "{d}"' for d in inverter_ids]
+    )
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) =>
+                r._field == "ac_active_power_kw" or
+                r._field == "energy_daily_kwh"    or
+                r._field == "grid_frequency_hz"         or
+                r._field == "ac_power_factor"           or
+                r._field == "internal_temp_c" or
+                r._field == "inverter_efficiency_pct"   or
+                r._field == "ac_reactive_power_kvar"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    tables      = query_api.query(flux, org=INFLUX_ORG)
+    device_data = {}
+    device_times = {}
+
+    for table in tables:
+        for record in table.records:
+            device = record.values.get('device')
+            field  = record.get_field()
+            value  = record.get_value()
+            time   = record.get_time()
+
+            if device not in device_data:
+                device_data[device] = {}
+            device_data[device][field] = value
+
+            if device not in device_times or time > device_times[device]:
+                device_times[device] = time
+
+    return device_data, device_times
+
+
+def _query_meter_snapshot(query_api, bucket, site_id, meter_id):
+    """
+    Internal: fetches latest values from the plant meter.
+    Returns { 'current_phase_a': 3.14, 'voltage_line_ab_v': 10.9, ... }
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) =>
+                r._field == "current_phase_a"        or
+                r._field == "current_phase_b"        or
+                r._field == "current_phase_c"        or
+                r._field == "voltage_line_ab_v"      or
+                r._field == "voltage_line_bc_v"      or
+                r._field == "voltage_line_ca_v"      or
+                r._field == "reactive_power_total_kvar"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    tables      = query_api.query(flux, org=INFLUX_ORG)
+    meter_data  = {}
+
+    for table in tables:
+        for record in table.records:
+            meter_data[record.get_field()] = record.get_value()
+
+    return meter_data
+
+
+def _query_power_trend(query_api, bucket, site_id, inverter_ids, interval_minutes):
+    """
+    Internal: fetches today's power trend aggregated by interval.
+    Returns [ { 'time': '...', 'total_kw': 104.0 }, ... ]
+    """
+    device_filter = ' or '.join(
+        [f'r.device == "{d}"' for d in inverter_ids]
+    )
+    start = get_ist_midnight_utc()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "ac_active_power_kw")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: {interval_minutes}m, fn: mean, createEmpty: false)
+            |> pivot(rowKey: ["_time"], columnKey: ["device"], valueColumn: "_value")
+    '''
+
+    tables  = query_api.query(flux, org=INFLUX_ORG)
+    results = []
+
+    for table in tables:
+        for record in table.records:
+            total = sum(
+                record.values.get(d) or 0.0
+                for d in inverter_ids
+            )
+            results.append({
+                'time':     record.get_time().isoformat(),
+                'total_kw': round(total, 2),
+            })
+
+    results.sort(key=lambda x: x['time'])
+    return results
+
+
+def get_dashboard_overview(bucket, site_id, inverter_ids, meter_id, interval_minutes=5):
+    """
+    Main dashboard overview — single function, three internal queries.
+    Returns everything the plant overview page needs in one call.
+
+    Args:
+        bucket           : InfluxDB bucket (from Customer.influx_bucket)
+        site_id          : site tag (from Site.influx_site_id)
+        inverter_ids     : list of inverter device tags
+        meter_id         : plant meter device tag
+        interval_minutes : power trend aggregation window
+
+    Returns a single dict with plant, grid, inverters and power_trend.
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    try:
+        # Fire all three queries
+        inverter_data, inverter_times = _query_inverter_snapshot(
+            query_api, bucket, site_id, inverter_ids
+        )
+        meter_data = _query_meter_snapshot(
+            query_api, bucket, site_id, meter_id
+        )
+        power_trend = _query_power_trend(
+            query_api, bucket, site_id, inverter_ids, interval_minutes
+        )
+
+        client.close()
+
+        # ── Aggregate inverter values ──────────────────────────────────────────
+        total_active_power  = 0.0
+        total_daily_gen     = 0.0
+        grid_freq           = None
+        power_factor        = None
+        last_updated        = None
+
+        inverter_list = []
+
+        for device_id in inverter_ids:
+            fields = inverter_data.get(device_id, {})
+            t      = inverter_times.get(device_id)
+
+            total_active_power += fields.get('ac_active_power_kw', 0.0)
+            total_daily_gen    += fields.get('energy_daily_kwh', 0.0)
+
+            if grid_freq is None:
+                grid_freq    = fields.get('grid_frequency_hz')
+            if power_factor is None:
+                power_factor = fields.get('ac_power_factor')
+            if last_updated is None or (t and t > last_updated):
+                last_updated = t
+
+            inverter_list.append({
+                'device_id':       device_id,
+                'active_power_kw': round(fields.get('ac_active_power_kw', 0.0), 2),
+                'daily_gen_kwh':   round(fields.get('energy_daily_kwh', 0.0), 3),
+                'internal_temp_c':    round(fields.get('internal_temp_c', 0.0), 1),
+                'inverter_efficiency_pct':      round(fields.get('inverter_efficiency_pct', 0.0), 1),
+                'status':          'online' if fields else 'offline',
+                'last_updated':    t.isoformat() if t else None,
+            })
+
+        # ── Assemble final response ────────────────────────────────────────────
+        return {
+            'last_updated': last_updated.isoformat() if last_updated else None,
+
+            'plant': {
+                'active_power_kw':    round(total_active_power, 2),
+                'reactive_power_kvar': round(meter_data.get('reactive_power_total_kvar', 0.0), 2),
+                'energy_today_kwh':   round(total_daily_gen, 3),
+                'frequency_hz':       round(grid_freq, 2) if grid_freq else None,
+                'power_factor':       round(power_factor, 2) if power_factor else None,
+            },
+
+            'grid': {
+                'current_a':    round(meter_data.get('current_phase_a', 0.0), 2),
+                'current_b':    round(meter_data.get('current_phase_b', 0.0), 2),
+                'current_c':    round(meter_data.get('current_phase_c', 0.0), 2),
+                'voltage_ab':   round(meter_data.get('voltage_line_ab_v', 0.0), 3),
+                'voltage_bc':   round(meter_data.get('voltage_line_bc_v', 0.0), 3),
+                'voltage_ca':   round(meter_data.get('voltage_line_ca_v', 0.0), 3),
+            },
+
+            'inverters':    inverter_list,
+            'power_trend':  power_trend,
+        }
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Dashboard overview query failed: {str(e)}')
+
+
+# ── Daily Energy (Separate Endpoint) ──────────────────────────────────────────
+
+def get_daily_energy(bucket, site_id, meter_id, days=7):
+    """
+    Returns daily generation for the last N days.
+    Uses meter1 energy_active_export_kwh — calculates last - first per day.
+    Matches exactly the Grafana query logic.
+    IST timezone aware.
+
+    Returns:
+    [
+        { 'date': '2026-05-31', 'energy_kwh': 6250.0 },
+        { 'date': '2026-06-01', 'energy_kwh': 6290.0 },
+        ...
+    ]
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    start = get_n_days_ago_midnight_utc(days)
+    ist_offset = '5h30m'
+
+    # Matches the Grafana query exactly:
+    # daily = last(energy_export) - first(energy_export) per day
+    flux = f'''
+        import "date"
+        import "timezone"
+
+        option location = timezone.fixed(offset: {ist_offset})
+
+        day_first = from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: 1d, fn: first, createEmpty: false, timeSrc: "_start")
+            |> map(fn: (r) => ({{r with _field: "v_first"}}))
+
+        day_last = from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: 1d, fn: last, createEmpty: false, timeSrc: "_start")
+            |> map(fn: (r) => ({{r with _field: "v_last"}}))
+
+        union(tables: [day_first, day_last])
+            |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+            |> map(fn: (r) => ({{
+                _time  : r._time,
+                _value : r.v_last - r.v_first,
+                _field : "daily_generation_kwh"
+            }}))
+            |> keep(columns: ["_time", "_value", "_field"])
+    '''
+
+    try:
+        tables  = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        results = []
+        for table in tables:
+            for record in table.records:
+                # Convert UTC time to IST date for display
+                utc_time  = record.get_time()
+                ist_tz    = timezone(timedelta(hours=5, minutes=30))
+                ist_time  = utc_time.astimezone(ist_tz)
+
+                results.append({
+                    'date':       ist_time.strftime('%Y-%m-%d'),
+                    'energy_kwh': round(record.get_value(), 2),
+                })
+
+        results.sort(key=lambda x: x['date'])
+        return results
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Daily energy query failed: {str(e)}')
+
+
+# ── System Health (unchanged from before) ─────────────────────────────────────
+
+def get_system_health(bucket, site_id, device_id, range_hours=3):
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -{range_hours}h)
+            |> filter(fn: (r) => r._measurement == "system_health")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) =>
+                r._field == "cpu_percent" or
+                r._field == "cpu_temp"    or
+                r._field == "ram_percent" or
+                r._field == "heartbeat"
+            )
+    '''
+
+    try:
+        tables  = query_api.query(flux, org=INFLUX_ORG)
+        results = []
+        for table in tables:
+            for record in table.records:
+                results.append({
+                    'time':  record.get_time().isoformat(),
+                    'field': record.get_field(),
+                    'value': record.get_value(),
+                })
+        client.close()
+        return results
+    except Exception as e:
+        client.close()
+        raise Exception(f'System health query failed: {str(e)}')
+
+
+def get_latest_system_health(bucket, site_id, device_id):
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "system_health")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> last()
+    '''
+
+    try:
+        tables = query_api.query(flux, org=INFLUX_ORG)
+        result = {}
+        for table in tables:
+            for record in table.records:
+                result[record.get_field()] = record.get_value()
+                result['last_updated']     = record.get_time().isoformat()
+        client.close()
+        return result
+    except Exception as e:
+        client.close()
+        raise Exception(f'System health latest query failed: {str(e)}')
+    
+
+# ── Plant Overview Queries ─────────────────────────────────────────────────────
+
+def _query_meter_today_energy(query_api, bucket, site_id, meter_id):
+    """
+    Internal: calculates today's generation from meter1.
+    Uses last - first of energy_active_export_kwh since IST midnight.
+    """
+    start = get_ist_midnight_utc()
+
+    flux_first = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> first()
+    '''
+
+    flux_last = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    first_val = None
+    last_val  = None
+
+    tables = query_api.query(flux_first, org=INFLUX_ORG)
+    for table in tables:
+        for record in table.records:
+            first_val = record.get_value()
+
+    tables = query_api.query(flux_last, org=INFLUX_ORG)
+    for table in tables:
+        for record in table.records:
+            last_val = record.get_value()
+
+    if first_val is not None and last_val is not None:
+        return round(last_val - first_val, 2)
+    return 0.0
+
+
+def _query_meter_live(query_api, bucket, site_id, meter_id):
+    """
+    Internal: fetches all live meter1 fields in one query.
+    Returns flat dict of field → value.
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) =>
+                r._field == "active_power_total_kw"     or
+                r._field == "voltage_line_ab_v"         or
+                r._field == "voltage_line_bc_v"         or
+                r._field == "voltage_line_ca_v"         or
+                r._field == "current_phase_a"           or
+                r._field == "current_phase_b"           or
+                r._field == "current_phase_c"           or
+                r._field == "grid_frequency_hz"         or
+                r._field == "power_factor_total"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    tables     = query_api.query(flux, org=INFLUX_ORG)
+    meter_data = {}
+
+    for table in tables:
+        for record in table.records:
+            meter_data[record.get_field()] = record.get_value()
+
+    return meter_data
+
+
+def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
+    """
+    Internal: fetches per-inverter ac_active_power_kw and energy_daily_kwh.
+    Also determines online/offline status.
+    """
+    device_filter = ' or '.join(
+        [f'r.device == "{d}"' for d in inverter_ids]
+    )
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) =>
+                r._field == "ac_active_power_kw" or
+                r._field == "energy_daily_kwh"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    tables       = query_api.query(flux, org=INFLUX_ORG)
+    device_data  = {}
+    device_times = {}
+
+    for table in tables:
+        for record in table.records:
+            device = record.values.get('device')
+            field  = record.get_field()
+            value  = record.get_value()
+            time   = record.get_time()
+
+            if device not in device_data:
+                device_data[device] = {}
+            device_data[device][field] = value
+
+            if device not in device_times or time > device_times[device]:
+                device_times[device] = time
+
+    return device_data, device_times
+
+
+def _query_plant_power_trend(query_api, bucket, site_id, meter_id, start, end, interval_minutes):
+    """
+    Internal: fetches meter1 active_power_total_kw trend.
+    start/end are UTC timestamp strings.
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "active_power_total_kw")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: {interval_minutes}m, fn: mean, createEmpty: false)
+    '''
+
+    tables  = query_api.query(flux, org=INFLUX_ORG)
+    results = []
+
+    for table in tables:
+        for record in table.records:
+            results.append({
+                'time':     record.get_time().isoformat(),
+                'power_kw': abs(round(record.get_value() or 0.0, 2)),
+            })
+
+    results.sort(key=lambda x: x['time'])
+    return results
+
+
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id):
+    """
+    Plant overview — single function, four internal queries.
+    Returns everything for the plant overview page stat cards,
+    grid values, inverter status table and device summary.
+
+    Returns:
+    {
+        last_updated,
+        plant: {
+            active_power_kw,
+            energy_today_kwh,
+            frequency_hz,
+            power_factor,
+        },
+        grid: {
+            voltage_ab, voltage_bc, voltage_ca,
+            current_a, current_b, current_c,
+        },
+        inverters: [ { name, device_id, active_power_kw,
+                       daily_gen_kwh, status, last_updated } ],
+        device_summary: { total, online, offline }
+    }
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    try:
+        # Four internal queries, one client session
+        meter_live      = _query_meter_live(query_api, bucket, site_id, meter_id)
+        energy_today    = _query_meter_today_energy(query_api, bucket, site_id, meter_id)
+        inv_data, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
+
+        client.close()
+
+        # Build inverter list
+        inverter_list = []
+        online_count  = 0
+
+        for device_id in inverter_ids:
+            fields = inv_data.get(device_id, {})
+            t      = inv_times.get(device_id)
+            is_online = bool(fields)
+
+            if is_online:
+                online_count += 1
+
+            inverter_list.append({
+                'device_id':       device_id,
+                'active_power_kw': round(fields.get('ac_active_power_kw', 0.0), 2),
+                'daily_gen_kwh':   round(fields.get('energy_daily_kwh', 0.0), 3),
+                'status':          'online' if is_online else 'offline',
+                'last_updated':    t.isoformat() if t else None,
+            })
+
+        total_inverters = len(inverter_ids)
+
+        return {
+            'last_updated': inv_times and max(
+                (t for t in inv_times.values() if t),
+                default=None
+            ),
+
+            'plant': {
+                'active_power_kw':  abs(round(meter_live.get('active_power_total_kw', 0.0), 2)),
+                'energy_today_kwh': energy_today,
+                'frequency_hz':     round(meter_live.get('grid_frequency_hz', 0.0), 2),
+                'power_factor':     round(meter_live.get('power_factor_total', 0.0), 2),
+            },
+
+            'grid': {
+                'voltage_ab': round(meter_live.get('voltage_line_ab_v', 0.0), 3),
+                'voltage_bc': round(meter_live.get('voltage_line_bc_v', 0.0), 3),
+                'voltage_ca': round(meter_live.get('voltage_line_ca_v', 0.0), 3),
+                'current_a':  round(meter_live.get('current_phase_a', 0.0), 2),
+                'current_b':  round(meter_live.get('current_phase_b', 0.0), 2),
+                'current_c':  round(meter_live.get('current_phase_c', 0.0), 2),
+            },
+
+            'inverters': inverter_list,
+
+            'device_summary': {
+                'total':   total_inverters,
+                'online':  online_count,
+                'offline': total_inverters - online_count,
+            },
+        }
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Plant overview query failed: {str(e)}')
+
+
+def get_plant_power_trend(bucket, site_id, meter_id, date_str=None, interval_minutes=5):
+    """
+    Plant power trend for a selected date.
+    date_str: 'YYYY-MM-DD' in IST. Defaults to today if not provided.
+    Returns meter1 active_power_total_kw aggregated every interval_minutes.
+
+    Returns:
+    [
+        { 'time': '2026-06-03T04:30:00Z', 'power_kw': 0.0 },
+        { 'time': '2026-06-03T05:00:00Z', 'power_kw': 104.5 },
+        ...
+    ]
+    """
+    ist = timezone(timedelta(hours=5, minutes=30))
+
+    if date_str:
+        # Parse the requested date in IST
+        try:
+            requested_date = datetime.strptime(date_str, '%Y-%m-%d')
+            requested_date = requested_date.replace(tzinfo=ist)
+        except ValueError:
+            raise Exception(f'Invalid date format: {date_str}. Use YYYY-MM-DD.')
+    else:
+        # Default to today IST
+        requested_date = datetime.now(ist).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+    # Start = midnight IST of requested date → UTC
+    start_ist = requested_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_ist.astimezone(timezone.utc)
+
+    # End = midnight IST next day → UTC (or now if today)
+    now_ist   = datetime.now(ist)
+    today_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if start_ist.date() == today_ist.date():
+        # Today — end at now
+        end_utc = datetime.now(timezone.utc)
+    else:
+        # Past date — end at midnight of next day
+        end_ist = start_ist + timedelta(days=1)
+        end_utc = end_ist.astimezone(timezone.utc)
+
+    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    try:
+        results = _query_plant_power_trend(
+            query_api, bucket, site_id, meter_id,
+            start_str, end_str, interval_minutes
+        )
+        client.close()
+        return results
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Plant power trend query failed: {str(e)}')
+    
+
+    # ── Inverter Overview Queries ──────────────────────────────────────────────────
+
+def get_inverter_overview(bucket, site_id, inverter_ids):
+    """
+    Fetches all live inverter data in one query.
+    Returns summary (totals) + per inverter breakdown.
+
+    Fields fetched per inverter:
+        ac_active_power_kw, energy_daily_kwh, energy_total_kwh,
+        grid_frequency_hz, ac_power_factor, ac_reactive_power_kvar,
+        inverter_efficiency_pct
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    device_filter = ' or '.join(
+        [f'r.device == "{d}"' for d in inverter_ids]
+    )
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) =>
+                r._field == "ac_active_power_kw"      or
+                r._field == "energy_daily_kwh"         or
+                r._field == "energy_total_kwh"         or
+                r._field == "grid_frequency_hz"        or
+                r._field == "ac_power_factor"          or
+                r._field == "ac_reactive_power_kvar"   or
+                r._field == "inverter_efficiency_pct"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    try:
+        tables       = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        # Collect per device
+        device_data  = {}
+        device_times = {}
+
+        for table in tables:
+            for record in table.records:
+                device = record.values.get('device')
+                field  = record.get_field()
+                value  = record.get_value()
+                time   = record.get_time()
+
+                if device not in device_data:
+                    device_data[device] = {}
+                device_data[device][field] = value
+
+                if device not in device_times or time > device_times[device]:
+                    device_times[device] = time
+
+        # Build per inverter list and totals
+        inverter_list        = []
+        total_active_power   = 0.0
+        total_daily_gen      = 0.0
+        online_count         = 0
+
+        for device_id in inverter_ids:
+            fields    = device_data.get(device_id, {})
+            t         = device_times.get(device_id)
+            is_online = bool(fields)
+
+            if is_online:
+                online_count += 1
+
+            active_power = abs(round(fields.get('ac_active_power_kw', 0.0), 2))
+            daily_gen    = abs(round(fields.get('energy_daily_kwh', 0.0), 3))
+
+            total_active_power += active_power
+            total_daily_gen    += daily_gen
+
+            inverter_list.append({
+                'device_id':               device_id,
+                'ac_active_power_kw':      active_power,
+                'energy_daily_kwh':        daily_gen,
+                'energy_total_kwh':        abs(round(fields.get('energy_total_kwh', 0.0), 2)),
+                'ac_reactive_power_kvar':  abs(round(fields.get('ac_reactive_power_kvar', 0.0), 2)),
+                'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
+                'grid_frequency_hz':       round(fields.get('grid_frequency_hz', 0.0), 2),
+                'inverter_efficiency_pct': round(fields.get('inverter_efficiency_pct', 0.0), 1),
+                'status':                  'online' if is_online else 'offline',
+                'last_updated':            t.isoformat() if t else None,
+            })
+
+        return {
+            'summary': {
+                'total_ac_active_power_kw': round(total_active_power, 2),
+                'total_energy_daily_kwh':   round(total_daily_gen, 3),
+                'online_count':             online_count,
+                'total_count':              len(inverter_ids),
+            },
+            'inverters': inverter_list,
+        }
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Inverter overview query failed: {str(e)}')
+
+
+def get_inverter_power_trend(bucket, site_id, inverter_ids, date_str=None, interval_minutes=5):
+    """
+    Inverter power trend for a selected date.
+    Sums ac_active_power_kw across all inverters per time bucket.
+    date_str: 'YYYY-MM-DD' in IST. Defaults to today if not provided.
+    """
+    ist = timezone(timedelta(hours=5, minutes=30))
+
+    if date_str:
+        try:
+            requested_date = datetime.strptime(date_str, '%Y-%m-%d')
+            requested_date = requested_date.replace(tzinfo=ist)
+        except ValueError:
+            raise Exception(f'Invalid date format: {date_str}. Use YYYY-MM-DD.')
+    else:
+        requested_date = datetime.now(ist).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+    # Start = IST midnight → UTC
+    start_ist    = requested_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc    = start_ist.astimezone(timezone.utc)
+
+    # End = now if today, else next midnight
+    now_ist      = datetime.now(ist)
+    today_ist    = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if start_ist.date() == today_ist.date():
+        end_utc  = datetime.now(timezone.utc)
+    else:
+        end_ist  = start_ist + timedelta(days=1)
+        end_utc  = end_ist.astimezone(timezone.utc)
+
+    start_str    = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str      = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    device_filter = ' or '.join(
+        [f'r.device == "{d}"' for d in inverter_ids]
+    )
+
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start_str}, stop: {end_str})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "ac_active_power_kw")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: {interval_minutes}m, fn: mean, createEmpty: false)
+            |> pivot(rowKey: ["_time"], columnKey: ["device"], valueColumn: "_value")
+    '''
+
+    try:
+        tables  = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        results = []
+        for table in tables:
+            for record in table.records:
+                total = sum(
+                    abs(record.values.get(d) or 0.0)
+                    for d in inverter_ids
+                )
+                results.append({
+                    'time':     record.get_time().isoformat(),
+                    'power_kw': round(total, 2),
+                })
+
+        results.sort(key=lambda x: x['time'])
+        return results
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Inverter power trend query failed: {str(e)}')
+
+
+# ── Inverter Detail Page Queries ──────────────────────────────────────────────
+
+def _classify_pv_strings(pv_data, inverter_active_power_kw):
+    """
+    Internal: classifies each PV string's health from its latest current reading.
+    Mirrors the Grafana Flux logic exactly (fleet mean, drop thresholds, night window).
+
+    pv_data: { '01': 11.40, '02': 0.0, ... }  -- string number -> current in A
+    Returns a sorted list of { number, current_a, status }.
+    """
+    ist     = timezone(timedelta(hours=5, minutes=30))
+    hour    = datetime.now(ist).hour
+    is_night = hour >= 19 or hour < 4
+
+    is_inverter_off = abs(inverter_active_power_kw) == 0.0
+
+    active_values = [v for v in pv_data.values() if v > 0.5]
+    fleet_mean = sum(active_values) / len(active_values) if active_values else 0.0
+    fleet_down = is_inverter_off or fleet_mean < 0.5
+
+    results = []
+    for number, value in pv_data.items():
+        if is_night:
+            pv_status = 'night'
+        elif fleet_down:
+            pv_status = 'offline'
+        elif value < 0.1:
+            pv_status = 'dead'
+        else:
+            pct_drop = (fleet_mean - value) / fleet_mean if fleet_mean > 0 else 0.0
+            if pct_drop > 0.45:
+                pv_status = 'critical'
+            elif pct_drop > 0.15:
+                pv_status = 'warning'
+            else:
+                pv_status = 'healthy'
+
+        results.append({
+            'number':    number,
+            'current_a': round(value, 3),
+            'status':    pv_status,
+        })
+
+    results.sort(key=lambda r: int(r['number']))
+    return results
+
+
+def get_inverter_detail(bucket, site_id, device_id):
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) =>
+                r._field == "ac_active_power_kw"      or
+                r._field == "energy_daily_kwh"        or
+                r._field == "energy_total_kwh"        or
+                r._field == "ac_power_factor"         or
+                r._field == "inverter_efficiency_pct" or
+                r._field == "grid_frequency_hz"       or
+                r._field == "ac_reactive_power_kvar"  or
+                r._field == "internal_temp_c"         or
+                r._field == "grid_voltage_ab_v"       or
+                r._field == "grid_voltage_bc_v"       or
+                r._field == "grid_voltage_ca_v"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    try:
+        tables = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        fields    = {}
+        last_time = None
+
+        for table in tables:
+            for record in table.records:
+                fields[record.get_field()] = record.get_value()
+                t = record.get_time()
+                if last_time is None or t > last_time:
+                    last_time = t
+
+        is_online    = bool(fields)
+        active_power = abs(round(fields.get('ac_active_power_kw', 0.0), 2))
+
+        return {
+            'device_id':               device_id,
+            'ac_active_power_kw':      active_power,
+            'energy_daily_kwh':        abs(round(fields.get('energy_daily_kwh', 0.0), 3)),
+            'energy_total_kwh':        abs(round(fields.get('energy_total_kwh', 0.0), 2)),
+            'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
+            'inverter_efficiency_pct': round(fields.get('inverter_efficiency_pct', 0.0), 1),
+            'grid_frequency_hz':       round(fields.get('grid_frequency_hz', 0.0), 2),
+            'ac_reactive_power_kvar':  abs(round(fields.get('ac_reactive_power_kvar', 0.0), 2)),
+            'internal_temp_c':         round(fields.get('internal_temp_c', 0.0), 1),
+            'grid_voltage_ab_v':       round(fields.get('grid_voltage_ab_v', 0.0), 1),
+            'grid_voltage_bc_v':       round(fields.get('grid_voltage_bc_v', 0.0), 1),
+            'grid_voltage_ca_v':       round(fields.get('grid_voltage_ca_v', 0.0), 1),
+            'status':                  'online' if is_online else 'offline',
+            'last_updated':            last_time.isoformat() if last_time else None,
+        }
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Inverter detail query failed: {str(e)}')
+    
+
+def get_inverter_detail_power_trend(bucket, site_id, device_id, date_str=None, interval_minutes=5):
+    """
+    Powers both the 'DC Input vs Active Power' and 'Active vs Reactive Power' charts
+    on the inverter detail page — one device, one date, one query, three fields.
+    """
+    ist = timezone(timedelta(hours=5, minutes=30))
+
+    if date_str:
+        try:
+            requested_date = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=ist)
+        except ValueError:
+            raise Exception(f'Invalid date format: {date_str}. Use YYYY-MM-DD.')
+    else:
+        requested_date = datetime.now(ist).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    start_ist = requested_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_ist.astimezone(timezone.utc)
+
+    now_ist   = datetime.now(ist)
+    today_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if start_ist.date() == today_ist.date():
+        end_utc = datetime.now(timezone.utc)
+    else:
+        end_utc = (start_ist + timedelta(days=1)).astimezone(timezone.utc)
+
+    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start_str}, stop: {end_str})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) =>
+                r._field == "dc_input_power_kw"     or
+                r._field == "ac_active_power_kw"    or
+                r._field == "ac_reactive_power_kvar"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: {interval_minutes}m, fn: mean, createEmpty: false)
+            |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+    '''
+
+    try:
+        tables  = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        results = []
+        for table in tables:
+            for record in table.records:
+                results.append({
+                    'time':                   record.get_time().isoformat(),
+                    'dc_input_power_kw':      abs(round(record.values.get('dc_input_power_kw') or 0.0, 2)),
+                    'ac_active_power_kw':     abs(round(record.values.get('ac_active_power_kw') or 0.0, 2)),
+                    'ac_reactive_power_kvar': abs(round(record.values.get('ac_reactive_power_kvar') or 0.0, 2)),
+                })
+
+        results.sort(key=lambda x: x['time'])
+        return results
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Inverter detail power trend query failed: {str(e)}')
+    
+
+def get_inverter_daily_energy(bucket, site_id, device_id, days=7):
+    """
+    One inverter's own daily generation for the last N days.
+    Uses max() per day on energy_daily_kwh since it resets to 0 at midnight.
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+    start     = get_n_days_ago_midnight_utc(days)
+    ist_offset = '5h30m'
+
+    flux = f'''
+        import "timezone"
+
+        option location = timezone.fixed(offset: {ist_offset})
+
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) => r._field == "energy_daily_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")
+    '''
+
+    try:
+        tables  = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        results = []
+        ist_tz  = timezone(timedelta(hours=5, minutes=30))
+
+        for table in tables:
+            for record in table.records:
+                ist_time = record.get_time().astimezone(ist_tz)
+                results.append({
+                    'date':       ist_time.strftime('%Y-%m-%d'),
+                    'energy_kwh': abs(round(record.get_value(), 2)),
+                })
+
+        results.sort(key=lambda x: x['date'])
+        return results
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Inverter daily energy query failed: {str(e)}')
+    
+
+def get_all_inverters_pv_strings(bucket, site_id, inverter_ids):
+    """
+    Fetches PV string currents for every inverter at a site in a single query.
+    Returns { 'inverter1': { '01': 11.40, '02': 0.0, ... }, 'inverter2': {...}, ... }
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    device_filter = ' or '.join(
+        [f'r.device == "{d}"' for d in inverter_ids]
+    )
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field =~ /^pv_string_\\d+_current_a$/)
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    try:
+        tables = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        device_pv_data = {d: {} for d in inverter_ids}
+
+        for table in tables:
+            for record in table.records:
+                device = record.values.get('device')
+                match  = re.match(r'^pv_string_(\d+)_current_a$', record.get_field())
+                if match and device in device_pv_data:
+                    device_pv_data[device][match.group(1)] = record.get_value()
+
+        return device_pv_data
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'PV strings query failed: {str(e)}')
+    
+
+    # ── Meter Overview Query ───────────────────────────────────────────────────────
+
+def get_meter_overview(bucket, sites_with_meters):
+    """
+    Fetches live data for all meters across one or more sites
+    (main site + optional substation).
+
+    Args:
+        bucket             : InfluxDB bucket (from Customer.influx_bucket)
+        sites_with_meters  : list of dicts, one per site to query:
+            [
+                {
+                    'influx_site_id': 'siteA',
+                    'location': 'MAIN',
+                    'meters': [
+                        {'influx_device_id': 'meter1', 'name': 'Main Meter', 'pk': 1},
+                        ...
+                    ]
+                },
+                {
+                    'influx_site_id': 'siteA-gss',
+                    'location': 'SUBSTATION',
+                    'meters': [...]
+                }
+            ]
+
+    Returns a flat list of meter dicts, each tagged with its location and
+    Postgres pk so the frontend never has to worry about influx_device_id
+    collisions between main site and substation.
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    all_meters_result = []
+
+    try:
+        for site_group in sites_with_meters:
+            site_id = site_group['influx_site_id']
+            site_type = site_group['site_type']
+            meters   = site_group['meters']
+
+            if not meters:
+                continue
+
+            device_filter = ' or '.join(
+                [f'r.device == "{m["influx_device_id"]}"' for m in meters]
+            )
+
+            flux = f'''
+                from(bucket: "{bucket}")
+                    |> range(start: -10m)
+                    |> filter(fn: (r) => r._measurement == "solar_data")
+                    |> filter(fn: (r) => r.site == "{site_id}")
+                    |> filter(fn: (r) => {device_filter})
+                    |> filter(fn: (r) =>
+                        r._field == "active_power_total_kw"          or
+                        r._field == "reactive_power_total_kvar"      or
+                        r._field == "apparent_power_total_kva"       or
+                        r._field == "energy_active_export_kwh"       or
+                        r._field == "energy_active_import_kwh"       or
+                        r._field == "energy_active_net_kwh"          or
+                        r._field == "energy_reactive_export_kvarh"   or
+                        r._field == "energy_reactive_import_kvarh"   or
+                        r._field == "voltage_line_ab_v"              or
+                        r._field == "voltage_line_bc_v"              or
+                        r._field == "voltage_line_ca_v"              or
+                        r._field == "current_phase_a"                or
+                        r._field == "current_phase_b"                or
+                        r._field == "current_phase_c"                or
+                        r._field == "grid_frequency_hz"              or
+                        r._field == "power_factor_total"
+                    )
+                    |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+                    |> last()
+            '''
+
+            tables       = query_api.query(flux, org=INFLUX_ORG)
+            device_data  = {}
+            device_times = {}
+
+            for table in tables:
+                for record in table.records:
+                    device = record.values.get('device')
+                    field  = record.get_field()
+                    value  = record.get_value()
+                    time   = record.get_time()
+
+                    if device not in device_data:
+                        device_data[device] = {}
+                    device_data[device][field] = value
+
+                    if device not in device_times or time > device_times[device]:
+                        device_times[device] = time
+
+            # Build result for each meter in this site group, in order
+            for meter in meters:
+                influx_id = meter['influx_device_id']
+                fields    = device_data.get(influx_id, {})
+                t         = device_times.get(influx_id)
+                is_online = bool(fields)
+
+                all_meters_result.append({
+                    'device_pk':                   meter['pk'],
+                    'device_id':                    influx_id,
+                    'name':                          meter['name'],
+                    'site_type':                    site_type, 
+                    'active_power_total_kw':         round(fields.get('active_power_total_kw', 0.0), 2),
+                    'reactive_power_total_kvar':      round(fields.get('reactive_power_total_kvar', 0.0), 2),
+                    'apparent_power_total_kva':       round(fields.get('apparent_power_total_kva', 0.0), 2),
+                    'energy_active_export_kwh':       round(fields.get('energy_active_export_kwh', 0.0), 2),
+                    'energy_active_import_kwh':        round(fields.get('energy_active_import_kwh', 0.0), 2),
+                    'energy_active_net_kwh':           round(fields.get('energy_active_net_kwh', 0.0), 2),
+                    'energy_reactive_export_kvarh':    round(fields.get('energy_reactive_export_kvarh', 0.0), 2),
+                    'energy_reactive_import_kvarh':    round(fields.get('energy_reactive_import_kvarh', 0.0), 2),
+                    'voltage_line_ab_v':               round(fields.get('voltage_line_ab_v', 0.0), 2),
+                    'voltage_line_bc_v':               round(fields.get('voltage_line_bc_v', 0.0), 2),
+                    'voltage_line_ca_v':               round(fields.get('voltage_line_ca_v', 0.0), 2),
+                    'current_phase_a':                 round(fields.get('current_phase_a', 0.0), 2),
+                    'current_phase_b':                 round(fields.get('current_phase_b', 0.0), 2),
+                    'current_phase_c':                 round(fields.get('current_phase_c', 0.0), 2),
+                    'grid_frequency_hz':               round(fields.get('grid_frequency_hz', 0.0), 2),
+                    'power_factor_total':              round(fields.get('power_factor_total', 0.0), 2),
+                    'status':                          'online' if is_online else 'offline',
+                    'last_updated':                    t.isoformat() if t else None,
+                })
+
+        client.close()
+        return all_meters_result
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Meter overview query failed: {str(e)}')
+    
+
+# Analytics Data
+def get_analytics_data(bucket, site_id, device_field_map, date_str=None, interval_minutes=5):
+    """
+    device_field_map: { 'inverter1': 'ac_active_power_kw', 'meter1': 'active_power_total_kw' }
+    Returns: { 'inverter1': [ {time, value}, ... ], 'meter1': [...] }
+    """
+    ist = timezone(timedelta(hours=5, minutes=30))
+
+    if date_str:
+        try:
+            requested_date = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=ist)
+        except ValueError:
+            raise Exception(f'Invalid date format: {date_str}. Use YYYY-MM-DD.')
+    else:
+        requested_date = datetime.now(ist).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    start_ist = requested_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_ist.astimezone(timezone.utc)
+
+    now_ist   = datetime.now(ist)
+    today_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if start_ist.date() == today_ist.date():
+        end_utc = datetime.now(timezone.utc)
+    else:
+        end_utc = (start_ist + timedelta(days=1)).astimezone(timezone.utc)
+
+    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    match_clauses = ' or '.join(
+        f'(r.device == "{device}" and r._field == "{field}")'
+        for device, field in device_field_map.items()
+    )
+
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start_str}, stop: {end_str})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {match_clauses})
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: {interval_minutes}m, fn: mean, createEmpty: false)
+    '''
+
+    try:
+        tables  = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        results = {device: [] for device in device_field_map}
+
+        for table in tables:
+            for record in table.records:
+                device = record.values.get('device')
+                if device in results:
+                    results[device].append({
+                        'time':  record.get_time().isoformat(),
+                        'value': round(record.get_value(), 3),
+                    })
+
+        for device in results:
+            results[device].sort(key=lambda p: p['time'])
+
+        return results
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Analytics query failed: {str(e)}')
