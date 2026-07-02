@@ -1289,7 +1289,7 @@ def get_meter_overview(bucket, sites_with_meters):
                     'device_id':                    influx_id,
                     'name':                          meter['name'],
                     'site_type':                    site_type, 
-                    'active_power_total_kw':         round(fields.get('active_power_total_kw', 0.0), 2),
+                    'active_power_total_kw':         abs(round(fields.get('active_power_total_kw', 0.0), 2)),
                     'reactive_power_total_kvar':      round(fields.get('reactive_power_total_kvar', 0.0), 2),
                     'apparent_power_total_kva':       round(fields.get('apparent_power_total_kva', 0.0), 2),
                     'energy_active_export_kwh':       round(fields.get('energy_active_export_kwh', 0.0), 2),
@@ -1388,3 +1388,228 @@ def get_analytics_data(bucket, site_id, device_field_map, date_str=None, interva
     except Exception as e:
         client.close()
         raise Exception(f'Analytics query failed: {str(e)}')
+    
+
+# ── Installer Overview Queries ─────────────────────────────────────────────────
+
+def _query_installer_live_snapshot(query_api, bucket, site_meter_map, site_inverters_map):
+    """
+    Live active power per meter + inverter online count per site, one query.
+    site_meter_map:     { influx_site_id: meter_influx_device_id }
+    site_inverters_map: { influx_site_id: [inverter_influx_device_ids] }
+    Returns: { influx_site_id: { active_power_kw, meter_online, inverters_online, inverters_total, last_updated } }
+    """
+    site_ids = list(site_meter_map.keys())
+    site_filter   = ' or '.join([f'r.site == "{s}"' for s in site_ids])
+
+    all_devices   = set(site_meter_map.values())
+    for inv_ids in site_inverters_map.values():
+        all_devices.update(inv_ids)
+    device_filter = ' or '.join([f'r.device == "{d}"' for d in all_devices])
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => {site_filter})
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) =>
+                r._field == "active_power_total_kw" or
+                r._field == "ac_active_power_kw"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+
+    raw = {}  # { (site_tag, device_tag): { field: value, _time: time } }
+    for table in tables:
+        for record in table.records:
+            key = (record.values.get('site'), record.values.get('device'))
+            if key not in raw:
+                raw[key] = {}
+            raw[key][record.get_field()] = record.get_value()
+            raw[key]['_time'] = record.get_time()
+
+    results = {}
+    for influx_site_id in site_ids:
+        meter_id  = site_meter_map.get(influx_site_id)
+        inv_ids   = site_inverters_map.get(influx_site_id, [])
+        meter_rec = raw.get((influx_site_id, meter_id), {}) if meter_id else {}
+        last_time = meter_rec.get('_time')
+
+        results[influx_site_id] = {
+            'active_power_kw':  abs(round(meter_rec.get('active_power_total_kw', 0.0), 2)),
+            'meter_online':     bool(meter_rec),
+            'inverters_online': sum(1 for inv_id in inv_ids if raw.get((influx_site_id, inv_id))),
+            'inverters_total':  len(inv_ids),
+            'last_updated':     last_time.isoformat() if last_time else None,
+        }
+
+    return results
+
+
+def _query_installer_energy_today(query_api, bucket, site_meter_map):
+    """
+    Energy today (last - first since IST midnight) for all meters in this bucket.
+    site_meter_map: { influx_site_id: meter_influx_device_id }
+    Returns: { influx_site_id: energy_today_kwh }
+    """
+    site_ids      = list(site_meter_map.keys())
+    site_filter   = ' or '.join([f'r.site == "{s}"' for s in site_ids])
+    meter_ids     = list(set(site_meter_map.values()))
+    device_filter = ' or '.join([f'r.device == "{d}"' for d in meter_ids])
+    start         = get_ist_midnight_utc()
+    ist_offset    = '5h30m'
+
+    # aggregateWindow(every: 24h, timeSrc: "_start") ensures both first and last
+    # share the same _time (IST midnight), so pivot can match them correctly.
+    flux = f'''
+        import "timezone"
+
+        option location = timezone.fixed(offset: {ist_offset})
+
+        day_first = from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => {site_filter})
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: 24h, fn: first, createEmpty: false, timeSrc: "_start")
+            |> map(fn: (r) => ({{r with _field: "v_first"}}))
+
+        day_last = from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => {site_filter})
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: 24h, fn: last, createEmpty: false, timeSrc: "_start")
+            |> map(fn: (r) => ({{r with _field: "v_last"}}))
+
+        union(tables: [day_first, day_last])
+            |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+            |> map(fn: (r) => ({{r with _value: r.v_last - r.v_first}}))
+    '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+
+    # site + device tags are preserved through union → pivot → map
+    energy_map = {}  # { (site_tag, device_tag): energy_kwh }
+    for table in tables:
+        for record in table.records:
+            key = (record.values.get('site'), record.values.get('device'))
+            energy_map[key] = abs(round(record.get_value(), 2))
+
+    return {
+        influx_site_id: energy_map.get((influx_site_id, site_meter_map[influx_site_id]), 0.0)
+        for influx_site_id in site_ids
+    }
+
+
+def get_installer_overview(bucket_groups):
+    """
+    Fires 2 Flux queries per bucket (live snapshot + energy today).
+    bucket_groups: {
+        bucket_str: {
+            'meter_map':     { influx_site_id: meter_influx_device_id },
+            'inverters_map': { influx_site_id: [inv_influx_device_ids] },
+        }
+    }
+    Returns: { influx_site_id: { active_power_kw, energy_today_kwh, meter_online,
+                                  inverters_online, inverters_total, last_updated } }
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+    results   = {}
+
+    try:
+        for bucket, group in bucket_groups.items():
+            live   = _query_installer_live_snapshot(
+                query_api, bucket, group['meter_map'], group['inverters_map']
+            )
+            energy = _query_installer_energy_today(
+                query_api, bucket, group['meter_map']
+            )
+
+            for influx_site_id in group['meter_map']:
+                results[influx_site_id] = {
+                    **live.get(influx_site_id, {
+                        'active_power_kw': 0.0, 'meter_online': False,
+                        'inverters_online': 0, 'inverters_total': 0, 'last_updated': None,
+                    }),
+                    'energy_today_kwh': energy.get(influx_site_id, 0.0),
+                }
+
+        client.close()
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Installer overview query failed: {str(e)}')
+
+    return results
+
+# Weather Station 
+def get_weather_snapshot(bucket, site_id, device_id):
+    """
+    Live snapshot for the weather station page.
+    Single last() query over -10m for all 7 fields.
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) =>
+                r._field == "irradiation_inclined_wm2" or
+                r._field == "ambient_temp_c"           or
+                r._field == "module_temp_c"            or
+                r._field == "wind_speed_ms"            or
+                r._field == "wind_direction_deg"       or
+                r._field == "pressure_hpa"             or
+                r._field == "rain_mm"                  or
+                r._field == "humidity_pct"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    try:
+        tables    = query_api.query(flux, org=INFLUX_ORG)
+        client.close()
+
+        fields    = {}
+        last_time = None
+
+        for table in tables:
+            for record in table.records:
+                fields[record.get_field()] = record.get_value()
+                t = record.get_time()
+                if last_time is None or t > last_time:
+                    last_time = t
+
+        is_online = bool(fields)
+
+        return {
+            'irradiation_inclined_wm2': round(fields.get('irradiation_inclined_wm2', 0.0), 2),
+            'ambient_temp_c':           round(fields.get('ambient_temp_c', 0.0), 2),
+            'module_temp_c':            round(fields.get('module_temp_c', 0.0), 2),
+            'wind_speed_ms':            round(fields.get('wind_speed_ms', 0.0), 2),
+            'wind_direction_deg':       round(fields.get('wind_direction_deg', 0.0), 1),
+            'pressure_hpa':             round(fields.get('pressure_hpa', 0.0), 2),
+            'rain_mm':                  round(fields.get('rain_mm', 0.0), 2),
+            'humidity_pct':             round(fields.get('humidity_pct', 0.0), 1),
+            'status':                   'online' if is_online else 'offline',
+            'last_updated':             last_time.isoformat() if last_time else None,
+        }
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Weather snapshot query failed: {str(e)}')

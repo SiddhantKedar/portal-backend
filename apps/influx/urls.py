@@ -9,6 +9,8 @@ from .inverter_detail_views import InverterDetailView, InverterDetailPowerTrendV
 from .pv_strings_views import InverterPvStringsView
 from .meter_views import MeterOverviewView
 from .analytics_views import AnalyticsMetricsListView, AnalyticsView
+from .installer_views import InstallerOverviewView
+from .weather_views import WeatherSnapshotView
 
 urlpatterns = [
     path('system-health/',          SystemHealthView.as_view(),       name='system-health'),
@@ -37,4 +39,10 @@ urlpatterns = [
     # Analytics
     path('analytics/', AnalyticsView.as_view()),
     path('analytics/metrics/', AnalyticsMetricsListView.as_view()),
+
+    # Installer overview
+    path('installer/overview/', InstallerOverviewView.as_view()),
+
+    # Weather station Page
+    path('weather/', WeatherSnapshotView.as_view()),
 ]
