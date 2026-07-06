@@ -70,6 +70,13 @@ class Site(models.Model):
     # This must match exactly the 'site' tag value in InfluxDB
     influx_site_id = models.CharField(max_length=100)
 
+    dc_capacity_kw = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    ac_capacity_kw = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+
     is_active   = models.BooleanField(default=True)
     created_at  = models.DateTimeField(auto_now_add=True)
 
