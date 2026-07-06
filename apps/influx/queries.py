@@ -10,6 +10,11 @@ import re
 
 INFLUX_ORG = os.getenv('INFLUX_ORG')
 
+# CEA (Central Electricity Authority) all-India weighted average grid
+# emission factor, FY 2024-25, CO2 Baseline Database User Guide V21.0
+# (Nov 2025). Update when CEA publishes a new edition.
+CO2_AVOIDED_FACTOR_KG_PER_KWH = 0.71
+
 
 # ── Timezone Helper ────────────────────────────────────────────────────────────
 
@@ -509,7 +514,8 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
             |> filter(fn: (r) => {device_filter})
             |> filter(fn: (r) =>
                 r._field == "ac_active_power_kw" or
-                r._field == "energy_daily_kwh"
+                r._field == "energy_daily_kwh" or
+                r.field == "dc_input_power_kw"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -559,18 +565,51 @@ def _query_plant_power_trend(query_api, bucket, site_id, meter_id, start, end, i
         for record in table.records:
             results.append({
                 'time':     record.get_time().isoformat(),
-                'power_kw': abs(round(record.get_value() or 0.0, 2)),
+                'active_power_total_kw': abs(round(record.get_value() or 0.0, 2)),
             })
 
     results.sort(key=lambda x: x['time'])
     return results
 
 
-def get_plant_overview(bucket, site_id, inverter_ids, meter_id):
+def _query_irradiance_trend(query_api, bucket, site_id, device_id, start, end, interval_minutes):
     """
-    Plant overview — single function, four internal queries.
+    Internal: fetches weather station irradiation_inclined_wm2 trend.
+    Same shape/aggregation pattern as _query_plant_power_trend so the two
+    series line up on the same interval buckets.
+    Returns { time_iso: value } for merging onto the power trend by time.
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) => r._field == "irradiation_inclined_wm2")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: {interval_minutes}m, fn: mean, createEmpty: false)
+    '''
+
+    tables        = query_api.query(flux, org=INFLUX_ORG)
+    irradiance_map = {}
+
+    for table in tables:
+        for record in table.records:
+            irradiance_map[record.get_time().isoformat()] = round(record.get_value() or 0.0, 2)
+
+    return irradiance_map
+
+
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None):
+    """
+    Plant overview — single function, four or five internal queries.
     Returns everything for the plant overview page stat cards,
-    grid values, inverter status table and device summary.
+    grid values, inverter status table, device summary and weather snapshot.
+
+    weather_device_id is optional — sites without an active weather station
+    pass None and the weather query is skipped entirely (no wasted call).
+    Weather never fails the endpoint: offline/missing station returns zeros
+    with status 'offline', same as any other offline device on this page.
 
     Returns:
     {
@@ -587,23 +626,35 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id):
         },
         inverters: [ { name, device_id, active_power_kw,
                        daily_gen_kwh, status, last_updated } ],
-        device_summary: { total, online, offline }
+        device_summary: { total, online, offline },
+        weather: {
+            irradiation_inclined_wm2, ambient_temp_c, module_temp_c, status,
+        },
     }
     """
     client    = get_influx_client()
     query_api = client.query_api()
 
     try:
-        # Four internal queries, one client session
+        # Four or five internal queries, one client session
         meter_live      = _query_meter_live(query_api, bucket, site_id, meter_id)
         energy_today    = _query_meter_today_energy(query_api, bucket, site_id, meter_id)
         inv_data, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
+
+        weather_fields = {}
+        poa_wh_m2      = 0.0
+        if weather_device_id:
+            weather_fields = _query_weather_live(query_api, bucket, site_id, weather_device_id)
+            poa_wh_m2      = _query_poa_irradiation(
+                query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
+            )
 
         client.close()
 
         # Build inverter list
         inverter_list = []
         online_count  = 0
+        total_dc_power = 0.0
 
         for device_id in inverter_ids:
             fields = inv_data.get(device_id, {})
@@ -612,6 +663,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id):
 
             if is_online:
                 online_count += 1
+                total_dc_power += fields.get('dc_input_power_kw', 0.0)
 
             inverter_list.append({
                 'device_id':       device_id,
@@ -622,6 +674,22 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id):
             })
 
         total_inverters = len(inverter_ids)
+        poa_kwh_m2      = round(poa_wh_m2 / 1000.0, 4)
+        active_power_kw = abs(round(meter_live.get('active_power_total_kw', 0.0), 2))
+
+        performance_ratio_pct = None
+        if dc_capacity_kw and poa_kwh_m2 > 0:
+            performance_ratio_pct = round(
+                (energy_today / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
+            )
+
+        cuf_pct = None
+        if ac_capacity_kw:
+            cuf_pct = round(
+                (energy_today / (float(ac_capacity_kw) * 24)) * 100, 2
+            )
+
+        co2_avoided_today_kg = round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
 
         return {
             'last_updated': inv_times and max(
@@ -630,7 +698,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id):
             ),
 
             'plant': {
-                'active_power_kw':  abs(round(meter_live.get('active_power_total_kw', 0.0), 2)),
+                'active_power_kw':  active_power_kw,
                 'energy_today_kwh': energy_today,
                 'frequency_hz':     round(meter_live.get('grid_frequency_hz', 0.0), 2),
                 'power_factor':     round(meter_live.get('power_factor_total', 0.0), 2),
@@ -652,14 +720,47 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id):
                 'online':  online_count,
                 'offline': total_inverters - online_count,
             },
+
+            'weather': {
+                'irradiation_inclined_wm2': round(weather_fields.get('irradiation_inclined_wm2', 0.0), 2),
+                'ambient_temp_c':           round(weather_fields.get('ambient_temp_c', 0.0), 2),
+                'module_temp_c':            round(weather_fields.get('module_temp_c', 0.0), 2),
+                'status':                   'online' if weather_fields else 'offline',
+            },
+
+            'performance': {
+                'performance_ratio_pct':       performance_ratio_pct,
+                'cuf_pct':                     cuf_pct,
+                'poa_irradiation_kwh_m2':      poa_kwh_m2,
+                'dc_power_total_kw':           round(total_dc_power, 2),
+                'co2_avoided_today_kg':   co2_avoided_today_kg,
+            },
         }
 
     except Exception as e:
         client.close()
         raise Exception(f'Plant overview query failed: {str(e)}')
 
+def _trend_stats(results, field):
+    """
+    Internal: max/mean/last over an already-fetched trend series.
+    No Influx call — pure Python over the list get_plant_power_trend already
+    has in memory, so this costs nothing extra against the call budget.
+    results must be time-sorted (both trend queries already sort by time).
+    """
+    values = [point[field] for point in results]
 
-def get_plant_power_trend(bucket, site_id, meter_id, date_str=None, interval_minutes=5):
+    if not values:
+        return {'max': 0.0, 'mean': 0.0, 'last': 0.0}
+
+    return {
+        'max':  round(max(values), 2),
+        'mean': round(sum(values) / len(values), 2),
+        'last': round(values[-1], 2),
+    }
+
+
+def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, date_str=None, interval_minutes=5):
     """
     Plant power trend for a selected date.
     date_str: 'YYYY-MM-DD' in IST. Defaults to today if not provided.
@@ -714,8 +815,24 @@ def get_plant_power_trend(bucket, site_id, meter_id, date_str=None, interval_min
             query_api, bucket, site_id, meter_id,
             start_str, end_str, interval_minutes
         )
+
+        irradiance_map = {}
+        if weather_device_id:
+            irradiance_map = _query_irradiance_trend(
+                query_api, bucket, site_id, weather_device_id,
+                start_str, end_str, interval_minutes
+            )
+
         client.close()
-        return results
+        for point in results:
+            point['irradiation_inclined_wm2'] = irradiance_map.get(point['time'], 0.0)
+        return {
+            'data':  results,
+            'stats': {
+                'active_power_total_kw':    _trend_stats(results, 'active_power_total_kw'),
+                'irradiation_inclined_wm2': _trend_stats(results, 'irradiation_inclined_wm2'),
+            },
+        }
 
     except Exception as e:
         client.close()
@@ -1613,3 +1730,62 @@ def get_weather_snapshot(bucket, site_id, device_id):
     except Exception as e:
         client.close()
         raise Exception(f'Weather snapshot query failed: {str(e)}')
+    
+
+def _query_weather_live(query_api, bucket, site_id, device_id):
+    """
+    Internal: fetches the 3 weather fields needed on plant overview.
+    Same -10m snapshot pattern as _query_meter_live.
+    Returns flat dict of field → value (empty dict if station offline).
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) =>
+                r._field == "irradiation_inclined_wm2" or
+                r._field == "ambient_temp_c"           or
+                r._field == "module_temp_c"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+ 
+    tables       = query_api.query(flux, org=INFLUX_ORG)
+    weather_data = {}
+ 
+    for table in tables:
+        for record in table.records:
+            weather_data[record.get_field()] = record.get_value()
+ 
+    return weather_data
+
+
+def _query_poa_irradiation(query_api, bucket, site_id, device_id, start):
+    """
+    Internal: true cumulative plane-of-array irradiation since IST midnight,
+    using Flux's integral() to do the area-under-curve calc server-side.
+    irradiation_inclined_wm2 is an instantaneous rate (W/m²); integrating
+    it over time with unit: 1h gives Wh/m² directly.
+    Returns Wh/m² (0.0 if no weather data in range).
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) => r._field == "irradiation_inclined_wm2")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> integral(unit: 1h)
+    '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+
+    for table in tables:
+        for record in table.records:
+            return record.get_value() or 0.0
+
+    return 0.0

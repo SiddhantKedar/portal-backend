@@ -56,11 +56,11 @@ class DashboardOverviewView(TenantFilterMixin, APIView):
 
         # Get plant meter (meter1)
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True
+            site=site, device_type='METER', is_active=True, name='HT Meter'
         ).first()
         if not meter:
             return Response(
-                {'detail': 'No active meter found'},
+                {'detail': 'No HT meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -125,11 +125,11 @@ class DailyEnergyView(TenantFilterMixin, APIView):
             )
 
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True
+            site=site, device_type='METER', is_active=True, name='HT Meter'
         ).first()
         if not meter:
             return Response(
-                {'detail': 'No active meter found'},
+                {'detail': 'No HT meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -190,11 +190,11 @@ class PlantOverviewView(TenantFilterMixin, APIView):
             )
 
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True
+            site=site, device_type='METER', is_active=True, name='HT Meter'
         ).first()
         if not meter:
             return Response(
-                {'detail': 'No active meter found'},
+                {'detail': 'No HT meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -202,12 +202,22 @@ class PlantOverviewView(TenantFilterMixin, APIView):
         inverter_ids = list(name_map.keys())
         bucket       = site.customer.influx_bucket
 
+        # Optional — not every site has a weather station yet, and an
+        # offline/missing station should never take down the rest of the page.
+        
+        weather_device = Device.objects.filter(
+            site=site, device_type='WEATHER_STATION', is_active=True
+        ).first()
+
         try:
             data = get_plant_overview(
                 bucket       = bucket,
                 site_id      = site.influx_site_id,
                 inverter_ids = inverter_ids,
                 meter_id     = meter.influx_device_id,
+                weather_device_id  = weather_device.influx_device_id if weather_device else None,
+                dc_capacity_kw     = site.dc_capacity_kw,
+                ac_capacity_kw     = site.ac_capacity_kw,
             )
 
             # Attach human readable names
@@ -262,30 +272,36 @@ class PlantPowerTrendView(TenantFilterMixin, APIView):
             )
 
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True
+            site=site, device_type='METER', is_active=True, name='HT Meter'
         ).first()
         if not meter:
             return Response(
-                {'detail': 'No active meter found'},
+                {'detail': 'No HT meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+        
+        weather_device = Device.objects.filter(
+            site=site, device_type='WEATHER_STATION', is_active=True
+        ).first()
 
         bucket = site.customer.influx_bucket
 
         try:
-            data = get_plant_power_trend(
-                bucket           = bucket,
-                site_id          = site.influx_site_id,
-                meter_id         = meter.influx_device_id,
-                date_str         = date_str,
-                interval_minutes = interval,
+            result = get_plant_power_trend(
+                bucket             = bucket,
+                site_id            = site.influx_site_id,
+                meter_id           = meter.influx_device_id,
+                weather_device_id  = weather_device.influx_device_id if weather_device else None,
+                date_str           = date_str,
+                interval_minutes   = interval,
             )
 
             return Response({
                 'site':     site.name,
                 'date':     date_str or 'today',
                 'interval': interval,
-                'data':     data,
+                'data':     result['data'],
+                'stats':    result['stats'],
             })
 
         except Exception as e:
