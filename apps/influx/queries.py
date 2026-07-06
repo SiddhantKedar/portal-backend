@@ -599,6 +599,149 @@ def _query_irradiance_trend(query_api, bucket, site_id, device_id, start, end, i
 
     return irradiance_map
 
+def _query_electrical_trend(query_api, bucket, site_id, meter_id, start, end, interval_minutes):
+    """
+    Internal: fetches HT meter voltage/current/frequency trend for a whole
+    day, aggregated every interval_minutes.
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) =>
+                r._field == "voltage_line_ab_v" or
+                r._field == "voltage_line_bc_v" or
+                r._field == "voltage_line_ca_v" or
+                r._field == "current_phase_a"   or
+                r._field == "current_phase_b"   or
+                r._field == "current_phase_c"   or
+                r._field == "grid_frequency_hz"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: {interval_minutes}m, fn: mean, createEmpty: false)
+    '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+
+    points_by_time = {}
+
+    for table in tables:
+        for record in table.records:
+            t = record.get_time().isoformat()
+            field = record.get_field()
+            points_by_time.setdefault(t, {'time': t})
+            points_by_time[t][field] = round(record.get_value() or 0.0, 2)
+
+    field_names = [
+        'voltage_line_ab_v', 'voltage_line_bc_v', 'voltage_line_ca_v',
+        'current_phase_a', 'current_phase_b', 'current_phase_c',
+        'grid_frequency_hz',
+    ]
+    results = []
+    for t in sorted(points_by_time.keys()):
+        point = points_by_time[t]
+        for field in field_names:
+            point.setdefault(field, 0.0)
+        results.append(point)
+
+    return results
+
+
+def get_plant_electrical_trend(bucket, site_id, meter_id, date_str=None, interval_minutes=5):
+    """
+    HT meter voltage/current/frequency trend for a selected date.
+    Separate endpoint/graph from power+irradiance — min/max/last stats,
+    not mean/max/last.
+    """
+    start_str, end_str = _resolve_ist_date_range(date_str)
+
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    try:
+        results = _query_electrical_trend(
+            query_api, bucket, site_id, meter_id,
+            start_str, end_str, interval_minutes
+        )
+        client.close()
+
+        field_names = [
+            'voltage_line_ab_v', 'voltage_line_bc_v', 'voltage_line_ca_v',
+            'current_phase_a', 'current_phase_b', 'current_phase_c',
+            'grid_frequency_hz',
+        ]
+
+        return {
+            'data':  results,
+            'stats': {
+                field: _trend_stats_minmax(results, field)
+                for field in field_names
+            },
+        }
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Plant electrical trend query failed: {str(e)}')
+
+
+def _trend_stats_minmax(results, field):
+    """
+    Internal: min/max/last over an already-fetched trend series.
+    Used for electrical parameters (voltage/current/frequency) where sags
+    and spikes matter more than the average — same convention as Grafana.
+    """
+    values = [point[field] for point in results]
+
+    if not values:
+        return {'min': 0.0, 'max': 0.0, 'last': 0.0}
+
+    return {
+        'min':  round(min(values), 2),
+        'max':  round(max(values), 2),
+        'last': round(values[-1], 2),
+    }
+
+
+def _resolve_ist_date_range(date_str):
+    """
+    Internal: resolves a 'YYYY-MM-DD' (or None for today) into UTC start/end
+    strings for a Flux range() over that full IST day.
+    Shared by every whole-day trend query (power, electrical, etc) so the
+    date/today/past-day logic lives in exactly one place.
+    Returns (start_str, end_str) as '%Y-%m-%dT%H:%M:%SZ' UTC strings.
+    """
+    ist = timezone(timedelta(hours=5, minutes=30))
+
+    if date_str:
+        try:
+            requested_date = datetime.strptime(date_str, '%Y-%m-%d')
+            requested_date = requested_date.replace(tzinfo=ist)
+        except ValueError:
+            raise Exception(f'Invalid date format: {date_str}. Use YYYY-MM-DD.')
+    else:
+        requested_date = datetime.now(ist).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+    start_ist = requested_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_ist.astimezone(timezone.utc)
+
+    now_ist   = datetime.now(ist)
+    today_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if start_ist.date() == today_ist.date():
+        end_utc = datetime.now(timezone.utc)
+    else:
+        end_ist = start_ist + timedelta(days=1)
+        end_utc = end_ist.astimezone(timezone.utc)
+
+    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    return start_str, end_str
+
 
 def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None):
     """
@@ -702,6 +845,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'energy_today_kwh': energy_today,
                 'frequency_hz':     round(meter_live.get('grid_frequency_hz', 0.0), 2),
                 'power_factor':     round(meter_live.get('power_factor_total', 0.0), 2),
+                'dc_capacity_kw':   float(dc_capacity_kw) if dc_capacity_kw else None,
+                'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
             },
 
             'grid': {
@@ -773,39 +918,7 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
         ...
     ]
     """
-    ist = timezone(timedelta(hours=5, minutes=30))
-
-    if date_str:
-        # Parse the requested date in IST
-        try:
-            requested_date = datetime.strptime(date_str, '%Y-%m-%d')
-            requested_date = requested_date.replace(tzinfo=ist)
-        except ValueError:
-            raise Exception(f'Invalid date format: {date_str}. Use YYYY-MM-DD.')
-    else:
-        # Default to today IST
-        requested_date = datetime.now(ist).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-
-    # Start = midnight IST of requested date → UTC
-    start_ist = requested_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_utc = start_ist.astimezone(timezone.utc)
-
-    # End = midnight IST next day → UTC (or now if today)
-    now_ist   = datetime.now(ist)
-    today_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    if start_ist.date() == today_ist.date():
-        # Today — end at now
-        end_utc = datetime.now(timezone.utc)
-    else:
-        # Past date — end at midnight of next day
-        end_ist = start_ist + timedelta(days=1)
-        end_utc = end_ist.astimezone(timezone.utc)
-
-    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    start_str, end_str = _resolve_ist_date_range(date_str)
 
     client    = get_influx_client()
     query_api = client.query_api()
@@ -1027,51 +1140,6 @@ def get_inverter_power_trend(bucket, site_id, inverter_ids, date_str=None, inter
 
 
 # ── Inverter Detail Page Queries ──────────────────────────────────────────────
-
-def _classify_pv_strings(pv_data, inverter_active_power_kw):
-    """
-    Internal: classifies each PV string's health from its latest current reading.
-    Mirrors the Grafana Flux logic exactly (fleet mean, drop thresholds, night window).
-
-    pv_data: { '01': 11.40, '02': 0.0, ... }  -- string number -> current in A
-    Returns a sorted list of { number, current_a, status }.
-    """
-    ist     = timezone(timedelta(hours=5, minutes=30))
-    hour    = datetime.now(ist).hour
-    is_night = hour >= 19 or hour < 4
-
-    is_inverter_off = abs(inverter_active_power_kw) == 0.0
-
-    active_values = [v for v in pv_data.values() if v > 0.5]
-    fleet_mean = sum(active_values) / len(active_values) if active_values else 0.0
-    fleet_down = is_inverter_off or fleet_mean < 0.5
-
-    results = []
-    for number, value in pv_data.items():
-        if is_night:
-            pv_status = 'night'
-        elif fleet_down:
-            pv_status = 'offline'
-        elif value < 0.1:
-            pv_status = 'dead'
-        else:
-            pct_drop = (fleet_mean - value) / fleet_mean if fleet_mean > 0 else 0.0
-            if pct_drop > 0.45:
-                pv_status = 'critical'
-            elif pct_drop > 0.15:
-                pv_status = 'warning'
-            else:
-                pv_status = 'healthy'
-
-        results.append({
-            'number':    number,
-            'current_a': round(value, 3),
-            'status':    pv_status,
-        })
-
-    results.sort(key=lambda r: int(r['number']))
-    return results
-
 
 def get_inverter_detail(bucket, site_id, device_id):
     client    = get_influx_client()

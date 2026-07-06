@@ -2,7 +2,7 @@
 
 from django.urls import path
 from .views import SystemHealthView, SystemHealthLatestView
-from .dashboard_views import DashboardOverviewView, DailyEnergyView, PlantOverviewView, PlantPowerTrendView
+from .dashboard_views import DashboardOverviewView, DailyEnergyView, PlantOverviewView, PlantPowerTrendView, PlantElectricalTrendView
 
 from .inverter_views import InverterOverviewView, InverterPowerTrendView
 from .inverter_detail_views import InverterDetailView, InverterDetailPowerTrendView, InverterDailyEnergyView
@@ -20,6 +20,7 @@ urlpatterns = [
      # Plant overview page
     path('plant/overview/',         PlantOverviewView.as_view(),      name='plant-overview'),
     path('plant/power-trend/',      PlantPowerTrendView.as_view(),    name='plant-power-trend'),
+    path('plant/electrical-trend/', PlantElectricalTrendView.as_view(), name='plant-electrical-trend'),
 
     # Inverter overview
     path('inverter/overview/',       InverterOverviewView.as_view(),    name='inverter-overview'),
