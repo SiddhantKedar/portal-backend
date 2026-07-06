@@ -11,8 +11,7 @@ from core.permissions import IsAnyRole
 from core.mixins import TenantFilterMixin
 from apps.sites.models import Device
 
-from .queries import get_dashboard_overview, get_daily_energy, get_plant_overview, get_plant_power_trend   
-
+from .queries import get_dashboard_overview, get_daily_energy, get_plant_overview, get_plant_power_trend, get_plant_electrical_trend
 
 class DashboardOverviewView(TenantFilterMixin, APIView):
     """
@@ -294,6 +293,69 @@ class PlantPowerTrendView(TenantFilterMixin, APIView):
                 weather_device_id  = weather_device.influx_device_id if weather_device else None,
                 date_str           = date_str,
                 interval_minutes   = interval,
+            )
+
+            return Response({
+                'site':     site.name,
+                'date':     date_str or 'today',
+                'interval': interval,
+                'data':     result['data'],
+                'stats':    result['stats'],
+            })
+
+        except Exception as e:
+            return Response(
+                {'detail': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+class PlantElectricalTrendView(TenantFilterMixin, APIView):
+    """
+    GET /api/v1/plant/electrical-trend/?site=1&date=2026-06-03&interval=5
+    HT meter voltage/current/frequency trend for a selected date.
+    """
+    permission_classes = [IsAnyRole]
+
+    def get(self, request):
+        site_id  = request.query_params.get('site')
+        date_str = request.query_params.get('date', None)
+        interval = int(request.query_params.get('interval', 5))
+
+        if not site_id:
+            return Response(
+                {'detail': 'site param is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if interval < 5:
+            interval = 5
+
+        try:
+            site = self.get_filtered_sites().get(pk=site_id)
+        except Exception:
+            return Response(
+                {'detail': 'Site not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        meter = Device.objects.filter(
+            site=site, device_type='METER', is_active=True, name='HT Meter'
+        ).first()
+        if not meter:
+            return Response(
+                {'detail': 'No active HT meter found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        bucket = site.customer.influx_bucket
+
+        try:
+            result = get_plant_electrical_trend(
+                bucket           = bucket,
+                site_id          = site.influx_site_id,
+                meter_id         = meter.influx_device_id,
+                date_str         = date_str,
+                interval_minutes = interval,
             )
 
             return Response({
