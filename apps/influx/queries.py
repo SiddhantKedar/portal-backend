@@ -169,6 +169,34 @@ def _query_power_trend(query_api, bucket, site_id, inverter_ids, interval_minute
     return results
 
 
+def _query_breaker_live(query_api, bucket, site_id, device_id):
+    """
+    Internal: fetches the main breaker's dido_05 digital input, live.
+    Only present on the main site's DIDO device — optional, same -10m
+    snapshot pattern as _query_weather_live.
+    Returns {'dido_05': 1.0 or 0.0} or {} if no recent data.
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) => r._field == "dido_05")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    tables       = query_api.query(flux, org=INFLUX_ORG)
+    breaker_data = {}
+
+    for table in tables:
+        for record in table.records:
+            breaker_data[record.get_field()] = record.get_value()
+
+    return breaker_data
+
+
 def get_dashboard_overview(bucket, site_id, inverter_ids, meter_id, interval_minutes=5):
     """
     Main dashboard overview — single function, three internal queries.
@@ -282,7 +310,7 @@ def get_daily_energy(bucket, site_id, meter_id, days=7):
     client    = get_influx_client()
     query_api = client.query_api()
 
-    start = get_n_days_ago_midnight_utc(days)
+    start = get_n_days_ago_midnight_utc(days - 1)
     ist_offset = '5h30m'
 
     # Matches the Grafana query exactly:
@@ -481,7 +509,8 @@ def _query_meter_live(query_api, bucket, site_id, meter_id):
                 r._field == "current_phase_b"           or
                 r._field == "current_phase_c"           or
                 r._field == "grid_frequency_hz"         or
-                r._field == "power_factor_total"
+                r._field == "power_factor_total"        or
+                r._field == "energy_active_export_kwh"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -743,7 +772,7 @@ def _resolve_ist_date_range(date_str):
     return start_str, end_str
 
 
-def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None):
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None):
     """
     Plant overview — single function, four or five internal queries.
     Returns everything for the plant overview page stat cards,
@@ -791,6 +820,10 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             poa_wh_m2      = _query_poa_irradiation(
                 query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
             )
+
+        breaker_fields = {}
+        if dido_device_id:
+            breaker_fields = _query_breaker_live(query_api, bucket, site_id, dido_device_id)
 
         client.close()
 
@@ -847,6 +880,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'power_factor':     round(meter_live.get('power_factor_total', 0.0), 2),
                 'dc_capacity_kw':   float(dc_capacity_kw) if dc_capacity_kw else None,
                 'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
+                'energy_active_export_kwh': round(meter_live.get('energy_active_export_kwh', 0.0), 2),
             },
 
             'grid': {
@@ -880,6 +914,12 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'dc_power_total_kw':           round(total_dc_power, 2),
                 'co2_avoided_today_kg':   co2_avoided_today_kg,
             },
+            
+            'breaker_status': (
+                'on' if breaker_fields.get('dido_05') == 1.0 else
+                'off' if breaker_fields.get('dido_05') == 0.0 else
+                None
+            ),
         }
 
     except Exception as e:
