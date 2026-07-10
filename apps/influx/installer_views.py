@@ -46,8 +46,8 @@ class InstallerOverviewView(APIView):
 
         # 2 Postgres queries — all meters and inverters for these sites at once
         meters = Device.objects.filter(
-            site_id__in=site_pks, device_type='METER', is_active=True
-        ).select_related('site').order_by('influx_device_id')
+            site_id__in=site_pks, device_type='METER', is_active=True, name='HT Meter'
+        ).select_related('site')
 
         inverters = Device.objects.filter(
             site_id__in=site_pks, device_type='INVERTER', is_active=True
@@ -59,8 +59,7 @@ class InstallerOverviewView(APIView):
         for m in meters:
             s = site_by_pk[m.site_id]
             iid = s.influx_site_id
-            if iid not in site_meter_influx:  # first one wins, not last
-                site_meter_influx[iid] = m.influx_device_id
+            site_meter_influx[iid] = m.influx_device_id
 
         site_inverters_influx = {}   # influx_site_id -> [inv influx_device_ids]
         for inv in inverters:
