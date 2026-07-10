@@ -50,11 +50,26 @@ class InverterDetailView(TenantFilterMixin, APIView):
         except Device.DoesNotExist:
             return Response({'detail': 'Inverter not found'}, status=status.HTTP_404_NOT_FOUND)
 
+        weather_device = Device.objects.filter(
+            site=site, device_type='WEATHER_STATION', is_active=True
+        ).first()
+        weather_device_id = weather_device.influx_device_id if weather_device else None
+
+        active_inverter_count = Device.objects.filter(
+            site=site, device_type='INVERTER', is_active=True
+        ).count()
+        dc_capacity_per_inverter = (
+            float(site.dc_capacity_kw) / active_inverter_count
+            if site.dc_capacity_kw and active_inverter_count > 0 else None
+        )
+
         try:
             data = get_inverter_detail(
-                bucket    = site.customer.influx_bucket,
-                site_id   = site.influx_site_id,
-                device_id = device.influx_device_id,
+                bucket                   = site.customer.influx_bucket,
+                site_id                  = site.influx_site_id,
+                device_id                = device.influx_device_id,
+                weather_device_id        = weather_device_id,
+                dc_capacity_per_inverter = dc_capacity_per_inverter,
             )
             data['name'] = device.name
 

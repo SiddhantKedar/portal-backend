@@ -58,4 +58,16 @@ ANALYTICS_METRICS = {
         'label': 'Internal Temperature', 'unit': '\u00b0C',
         'fields': {'INVERTER': 'internal_temp_c'},
     },
+    'irradiation': {
+        'label': 'Irradiation (POA)', 'unit': 'W/m\u00b2',
+        'fields': {'WEATHER_STATION': 'irradiation_inclined_wm2'},
+    },
+    'ambient_temp': {
+        'label': 'Ambient Temperature', 'unit': '\u00b0C',
+        'fields': {'WEATHER_STATION': 'ambient_temp_c'},
+    },
+    'module_temp': {
+        'label': 'Module Temperature', 'unit': '\u00b0C',
+        'fields': {'WEATHER_STATION': 'module_temp_c'},
+    },
 }

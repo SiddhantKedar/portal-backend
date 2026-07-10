@@ -994,7 +994,7 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
 
     # ── Inverter Overview Queries ──────────────────────────────────────────────────
 
-def get_inverter_overview(bucket, site_id, inverter_ids):
+def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None, dc_capacity_kw=None):
     """
     Fetches all live inverter data in one query.
     Returns summary (totals) + per inverter breakdown.
@@ -1032,6 +1032,13 @@ def get_inverter_overview(bucket, site_id, inverter_ids):
 
     try:
         tables       = query_api.query(flux, org=INFLUX_ORG)
+
+        poa_kwh_m2 = 0.0
+        if weather_device_id:
+            poa_wh_m2  = _query_poa_irradiation(
+                query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
+            )
+            poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
         client.close()
 
         # Collect per device
@@ -1058,6 +1065,11 @@ def get_inverter_overview(bucket, site_id, inverter_ids):
         total_daily_gen      = 0.0
         online_count         = 0
 
+        dc_capacity_per_inverter = (
+            float(dc_capacity_kw) / len(inverter_ids)
+            if dc_capacity_kw and len(inverter_ids) > 0 else None
+        )
+
         for device_id in inverter_ids:
             fields    = device_data.get(device_id, {})
             t         = device_times.get(device_id)
@@ -1072,6 +1084,12 @@ def get_inverter_overview(bucket, site_id, inverter_ids):
             total_active_power += active_power
             total_daily_gen    += daily_gen
 
+            inverter_pr_pct = None
+            if dc_capacity_per_inverter and poa_kwh_m2 > 0:
+                inverter_pr_pct = round(
+                    (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
+                )
+
             inverter_list.append({
                 'device_id':               device_id,
                 'ac_active_power_kw':      active_power,
@@ -1081,9 +1099,16 @@ def get_inverter_overview(bucket, site_id, inverter_ids):
                 'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
                 'grid_frequency_hz':       round(fields.get('grid_frequency_hz', 0.0), 2),
                 'inverter_efficiency_pct': round(fields.get('inverter_efficiency_pct', 0.0), 1),
+                'performance_ratio_pct':   inverter_pr_pct,
                 'status':                  'online' if is_online else 'offline',
                 'last_updated':            t.isoformat() if t else None,
             })
+
+        fleet_pr_pct = None
+        if dc_capacity_kw and poa_kwh_m2 > 0:
+            fleet_pr_pct = round(
+                (total_daily_gen / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
+            )
 
         return {
             'summary': {
@@ -1091,6 +1116,8 @@ def get_inverter_overview(bucket, site_id, inverter_ids):
                 'total_energy_daily_kwh':   round(total_daily_gen, 3),
                 'online_count':             online_count,
                 'total_count':              len(inverter_ids),
+                'performance_ratio_pct':    fleet_pr_pct,
+                'poa_irradiation_kwh_m2':   poa_kwh_m2,
             },
             'inverters': inverter_list,
         }
@@ -1181,7 +1208,7 @@ def get_inverter_power_trend(bucket, site_id, inverter_ids, date_str=None, inter
 
 # ── Inverter Detail Page Queries ──────────────────────────────────────────────
 
-def get_inverter_detail(bucket, site_id, device_id):
+def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_capacity_per_inverter=None):
     client    = get_influx_client()
     query_api = client.query_api()
 
@@ -1210,6 +1237,13 @@ def get_inverter_detail(bucket, site_id, device_id):
 
     try:
         tables = query_api.query(flux, org=INFLUX_ORG)
+        
+        poa_kwh_m2 = 0.0
+        if weather_device_id:
+            poa_wh_m2  = _query_poa_irradiation(
+                query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
+            )
+            poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
         client.close()
 
         fields    = {}
@@ -1224,14 +1258,23 @@ def get_inverter_detail(bucket, site_id, device_id):
 
         is_online    = bool(fields)
         active_power = abs(round(fields.get('ac_active_power_kw', 0.0), 2))
+        daily_gen    = abs(round(fields.get('energy_daily_kwh', 0.0), 3))
 
+        performance_ratio_pct = None
+        if dc_capacity_per_inverter and poa_kwh_m2 > 0:
+            performance_ratio_pct = round(
+                (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
+            )
+        
         return {
             'device_id':               device_id,
             'ac_active_power_kw':      active_power,
-            'energy_daily_kwh':        abs(round(fields.get('energy_daily_kwh', 0.0), 3)),
+            'energy_daily_kwh':        daily_gen,
             'energy_total_kwh':        abs(round(fields.get('energy_total_kwh', 0.0), 2)),
             'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
             'inverter_efficiency_pct': round(fields.get('inverter_efficiency_pct', 0.0), 1),
+            'performance_ratio_pct':   performance_ratio_pct,
+            'poa_irradiation_kwh_m2':  poa_kwh_m2,
             'grid_frequency_hz':       round(fields.get('grid_frequency_hz', 0.0), 2),
             'ac_reactive_power_kvar':  abs(round(fields.get('ac_reactive_power_kvar', 0.0), 2)),
             'internal_temp_c':         round(fields.get('internal_temp_c', 0.0), 1),
@@ -1508,6 +1551,7 @@ def get_meter_overview(bucket, sites_with_meters):
                 fields    = device_data.get(influx_id, {})
                 t         = device_times.get(influx_id)
                 is_online = bool(fields)
+                energy_today  = _query_meter_today_energy(query_api, bucket, site_id, influx_id)
 
                 all_meters_result.append({
                     'device_pk':                   meter['pk'],
@@ -1530,6 +1574,7 @@ def get_meter_overview(bucket, sites_with_meters):
                     'current_phase_c':                 round(fields.get('current_phase_c', 0.0), 2),
                     'grid_frequency_hz':               round(fields.get('grid_frequency_hz', 0.0), 2),
                     'power_factor_total':              round(fields.get('power_factor_total', 0.0), 2),
+                    'energy_today_kwh':                energy_today,
                     'status':                          'online' if is_online else 'offline',
                     'last_updated':                    t.isoformat() if t else None,
                 })
@@ -1543,10 +1588,19 @@ def get_meter_overview(bucket, sites_with_meters):
     
 
 # Analytics Data
-def get_analytics_data(bucket, site_id, device_field_map, date_str=None, interval_minutes=5):
+def get_analytics_data(bucket, site_id, series_map, date_str=None, interval_minutes=5):
     """
-    device_field_map: { 'inverter1': 'ac_active_power_kw', 'meter1': 'active_power_total_kw' }
-    Returns: { 'inverter1': [ {time, value}, ... ], 'meter1': [...] }
+    series_map: { series_key: {'device': 'inverter1', 'field': 'ac_active_power_kw'} }
+    series_key is caller-defined and unique per requested device+metric combo
+    (view uses '{influx_device_id}__{metric_key}').
+
+    Returns merged, time-aligned points:
+    [
+        { 'time': '2026-06-18T04:30:00Z', 'inverter1__active_power': 12.4, 'weather_station1__irradiation': 340.0 },
+        ...
+    ]
+    Points only carry keys for series that actually had data at that timestamp
+    (no forced zero-fill across series with different reporting devices).
     """
     ist = timezone(timedelta(hours=5, minutes=30))
 
@@ -1573,9 +1627,14 @@ def get_analytics_data(bucket, site_id, device_field_map, date_str=None, interva
     end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
     match_clauses = ' or '.join(
-        f'(r.device == "{device}" and r._field == "{field}")'
-        for device, field in device_field_map.items()
+        f'(r.device == "{s["device"]}" and r._field == "{s["field"]}")'
+        for s in series_map.values()
     )
+
+    # Reverse lookup: (device, field) -> series_key, for reassembling results
+    key_by_device_field = {
+        (s['device'], s['field']): key for key, s in series_map.items()
+    }
 
     client    = get_influx_client()
     query_api = client.query_api()
@@ -1590,24 +1649,28 @@ def get_analytics_data(bucket, site_id, device_field_map, date_str=None, interva
             |> aggregateWindow(every: {interval_minutes}m, fn: mean, createEmpty: false)
     '''
 
+
     try:
         tables  = query_api.query(flux, org=INFLUX_ORG)
         client.close()
 
-        results = {device: [] for device in device_field_map}
+        # Group by timestamp, merging every series' value into that timestamp's point
+        points_by_time = {}
 
         for table in tables:
             for record in table.records:
                 device = record.values.get('device')
-                if device in results:
-                    results[device].append({
-                        'time':  record.get_time().isoformat(),
-                        'value': round(record.get_value(), 3),
-                    })
+                field  = record.get_field()
+                key    = key_by_device_field.get((device, field))
+                if not key:
+                    continue
 
-        for device in results:
-            results[device].sort(key=lambda p: p['time'])
+                time_iso = record.get_time().isoformat()
+                if time_iso not in points_by_time:
+                    points_by_time[time_iso] = {'time': time_iso}
+                points_by_time[time_iso][key] = round(record.get_value(), 3)
 
+        results = sorted(points_by_time.values(), key=lambda p: p['time'])
         return results
 
     except Exception as e:

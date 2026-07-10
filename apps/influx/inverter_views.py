@@ -53,11 +53,18 @@ class InverterOverviewView(TenantFilterMixin, APIView):
         inverter_ids = list(name_map.keys())
         bucket       = site.customer.influx_bucket
 
+        weather_device = Device.objects.filter(
+            site=site, device_type='WEATHER_STATION', is_active=True
+        ).first()
+        weather_device_id = weather_device.influx_device_id if weather_device else None
+
         try:
             data = get_inverter_overview(
                 bucket       = bucket,
                 site_id      = site.influx_site_id,
                 inverter_ids = inverter_ids,
+                weather_device_id = weather_device_id,
+                dc_capacity_kw    = site.dc_capacity_kw,
             )
 
             # Attach human readable names
