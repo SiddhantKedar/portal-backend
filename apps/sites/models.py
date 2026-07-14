@@ -125,7 +125,10 @@ class Device(models.Model):
 
     is_active       = models.BooleanField(default=True)
     created_at      = models.DateTimeField(auto_now_add=True)
-
+    energy_offset_kwh = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        help_text='Manual correction added to raw meter lifetime energy reading '
+    )
     class Meta:
         db_table = 'devices'
         constraints = [

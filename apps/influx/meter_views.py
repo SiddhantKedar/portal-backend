@@ -50,7 +50,12 @@ class MeterOverviewView(TenantFilterMixin, APIView):
             'influx_site_id': site.influx_site_id,
             'site_type':      site.site_type,
             'meters': [
-                {'influx_device_id': d.influx_device_id, 'name': d.name, 'pk': d.id}
+                {
+                    'influx_device_id':  d.influx_device_id,
+                    'name':              d.name,
+                    'pk':                d.id,
+                    'energy_offset_kwh': float(d.energy_offset_kwh),
+                }
                 for d in main_meters
             ]
         }]
@@ -68,7 +73,11 @@ class MeterOverviewView(TenantFilterMixin, APIView):
                 'influx_site_id': substation.influx_site_id,
                 'site_type':       substation.site_type,
                 'meters': [
-                    {'influx_device_id': d.influx_device_id, 'name': d.name, 'pk': d.id}
+                    {'influx_device_id': d.influx_device_id, 
+                     'name': d.name, 
+                     'pk': d.id,
+                     'energy_offset_kwh': float(d.energy_offset_kwh),
+                    }
                     for d in sub_meters
                 ]
             })
