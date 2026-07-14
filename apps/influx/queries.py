@@ -15,6 +15,8 @@ INFLUX_ORG = os.getenv('INFLUX_ORG')
 # (Nov 2025). Update when CEA publishes a new edition.
 CO2_AVOIDED_FACTOR_KG_PER_KWH = 0.71
 
+MIN_POA_KWH_M2_FOR_PR = 0.1
+
 
 # ── Timezone Helper ────────────────────────────────────────────────────────────
 
@@ -772,7 +774,7 @@ def _resolve_ist_date_range(date_str):
     return start_str, end_str
 
 
-def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None):
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0):
     """
     Plant overview — single function, four or five internal queries.
     Returns everything for the plant overview page stat cards,
@@ -880,7 +882,9 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'power_factor':     round(meter_live.get('power_factor_total', 0.0), 2),
                 'dc_capacity_kw':   float(dc_capacity_kw) if dc_capacity_kw else None,
                 'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
-                'energy_active_export_kwh': round(meter_live.get('energy_active_export_kwh', 0.0), 2),
+                'energy_active_export_kwh': round(
+                    meter_live.get('energy_active_export_kwh', 0.0) + meter_energy_offset_kwh, 2
+                ) if meter_live else 0.0,
             },
 
             'grid': {
@@ -1551,6 +1555,11 @@ def get_meter_overview(bucket, sites_with_meters):
                 fields    = device_data.get(influx_id, {})
                 t         = device_times.get(influx_id)
                 is_online = bool(fields)
+                offset    = meter.get('energy_offset_kwh', 0.0)
+
+                raw_export_kwh = fields.get('energy_active_export_kwh', 0.0)
+                corrected_export_kwh = raw_export_kwh + offset if is_online else 0.0
+
                 energy_today  = _query_meter_today_energy(query_api, bucket, site_id, influx_id)
 
                 all_meters_result.append({
@@ -1561,7 +1570,7 @@ def get_meter_overview(bucket, sites_with_meters):
                     'active_power_total_kw':         abs(round(fields.get('active_power_total_kw', 0.0), 2)),
                     'reactive_power_total_kvar':      round(fields.get('reactive_power_total_kvar', 0.0), 2),
                     'apparent_power_total_kva':       round(fields.get('apparent_power_total_kva', 0.0), 2),
-                    'energy_active_export_kwh':       round(fields.get('energy_active_export_kwh', 0.0), 2),
+                    'energy_active_export_kwh':       round(corrected_export_kwh, 2),
                     'energy_active_import_kwh':        round(fields.get('energy_active_import_kwh', 0.0), 2),
                     'energy_active_net_kwh':           round(fields.get('energy_active_net_kwh', 0.0), 2),
                     'energy_reactive_export_kvarh':    round(fields.get('energy_reactive_export_kvarh', 0.0), 2),
@@ -1960,3 +1969,159 @@ def _query_poa_irradiation(query_api, bucket, site_id, device_id, start):
             return record.get_value() or 0.0
 
     return 0.0
+
+# Daily Snapshot to Posgres
+
+def _query_meter_energy_for_day(query_api, bucket, site_id, meter_id, start, end):
+    """
+    Internal: meter energy generated over a specific IST day (start/end
+    already resolved via _resolve_ist_date_range). Last-minus-first on the
+    cumulative export counter, range-bounded — safe for past dates.
+
+    Returns (energy_kwh, status):
+        (float, 'ok')       — trustworthy figure, may legitimately be 0.0
+        (None,  'no_data')  — meter reported nothing in this range
+        (None,  'anomaly')  — counter went backwards (rollover / meter swap /
+                              bad packet). Never store this as a real number.
+    """
+    flux_first = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> first()
+    '''
+    flux_last = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    first_val = None
+    last_val  = None
+
+    tables = query_api.query(flux_first, org=INFLUX_ORG)
+    for table in tables:
+        for record in table.records:
+            first_val = record.get_value()
+
+    tables = query_api.query(flux_last, org=INFLUX_ORG)
+    for table in tables:
+        for record in table.records:
+            last_val = record.get_value()
+
+    if first_val is None or last_val is None:
+        return None, 'no_data'
+
+    delta = last_val - first_val
+    if delta < 0:
+        # Cumulative counter moved backwards — this is never a valid
+        # generation figure. Flag it; do not store it.
+        return None, 'anomaly'
+
+    return round(delta, 3), 'ok'
+
+
+def _query_poa_irradiation_for_day(query_api, bucket, site_id, device_id, start, end):
+    """
+    Internal: POA irradiation integrated over a specific IST day.
+    Same integral() logic as _query_poa_irradiation, range-bounded.
+    Returns Wh/m² (0.0 if no weather data in range).
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) => r._field == "irradiation_inclined_wm2")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> integral(unit: 1h)
+    '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+
+    for table in tables:
+        for record in table.records:
+            return record.get_value() or 0.0
+
+    return 0.0
+
+
+def _query_meter_peak_power_for_day(query_api, bucket, site_id, meter_id, start, end):
+    """
+    Internal: max active_power_total_kw for a meter over a specific IST day,
+    and the timestamp it occurred at.
+    Returns (peak_kw, peak_time) — (None, None) if no data in range.
+    """
+    flux = f'''import "math"
+
+        from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "active_power_total_kw")
+            |> map(fn: (r) => ({{r with _value: math.abs(x: float(v: r._value))}}))
+            |> top(n: 1)
+        '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+
+    for table in tables:
+        for record in table.records:
+            return round(abs(record.get_value()), 2), record.get_time()
+
+    return None, None
+
+
+def _query_inverter_daily_sum_for_day(query_api, bucket, site_id, inverter_ids, start, end):
+    """
+    Internal: sum of each inverter's own energy_daily_kwh for the given IST day.
+
+    NOTE: uses max(), not last(). energy_daily_kwh is an accumulator that rises
+    through the generation day and then drops to 0 when the inverter shuts down
+    at sunset (and/or resets at its internal midnight). last() therefore reads a
+    sleeping inverter and returns 0.0. The day's total is the peak the counter
+    reached, not its value at 23:59.
+
+    Cross-check figure only — not the authoritative daily energy (that's the
+    meter). Expect this to run slightly ABOVE meter export, since it's measured
+    at the inverter AC terminals, before transformer/cable losses.
+
+    Returns (total_kwh, count_reporting).
+    """
+    device_filter = ' or '.join(f'r.device == "{d}"' for d in inverter_ids)
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "energy_daily_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> max()
+    '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+    total = 0.0
+    count = 0
+
+    for table in tables:
+        for record in table.records:
+            value = record.get_value()
+            if value is None:
+                continue
+            total += abs(value)
+            count += 1
+
+    return round(total, 3), count
