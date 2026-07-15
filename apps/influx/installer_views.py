@@ -31,6 +31,7 @@ class InstallerOverviewView(APIView):
 
         if not sites:
             return Response({
+                'installer_name': installer.name,
                 'fleet_summary': {
                     'total_active_power_kw':  0.0,
                     'total_energy_today_kwh': 0.0,
@@ -140,6 +141,7 @@ class InstallerOverviewView(APIView):
             })
 
         return Response({
+            'installer_name': installer.name,
             'fleet_summary': {
                 'total_active_power_kw':  round(total_active_power, 2),
                 'total_energy_today_kwh': round(total_energy_today, 2),
