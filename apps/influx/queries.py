@@ -17,6 +17,9 @@ CO2_AVOIDED_FACTOR_KG_PER_KWH = 0.71
 
 MIN_POA_KWH_M2_FOR_PR = 0.1
 
+# Determine when to show device is offline
+STALE_AFTER_SECONDS = 120
+
 
 # ── Timezone Helper ────────────────────────────────────────────────────────────
 
@@ -44,6 +47,15 @@ def get_n_days_ago_midnight_utc(n):
     midnight_ist = past_ist.replace(hour=0, minute=0, second=0, microsecond=0)
     midnight_utc = midnight_ist.astimezone(timezone.utc)
     return midnight_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+# Helper for checking if data is live :
+def _is_fresh(record_time):
+    """True if a record's timestamp is within the staleness threshold."""
+    if record_time is None:
+        return False
+    age = (datetime.now(timezone.utc) - record_time).total_seconds()
+    return age <= STALE_AFTER_SECONDS
 
 
 # ── Overview Queries ───────────────────────────────────────────────────────────
@@ -82,10 +94,13 @@ def _query_inverter_snapshot(query_api, bucket, site_id, inverter_ids):
 
     for table in tables:
         for record in table.records:
+            time = record.get_time()
+            if not _is_fresh(time):
+                continue
+
             device = record.values.get('device')
             field  = record.get_field()
             value  = record.get_value()
-            time   = record.get_time()
 
             if device not in device_data:
                 device_data[device] = {}
@@ -126,6 +141,8 @@ def _query_meter_snapshot(query_api, bucket, site_id, meter_id):
 
     for table in tables:
         for record in table.records:
+            if not _is_fresh(record.get_time()):
+                continue
             meter_data[record.get_field()] = record.get_value()
 
     return meter_data
@@ -173,30 +190,69 @@ def _query_power_trend(query_api, bucket, site_id, inverter_ids, interval_minute
 
 def _query_breaker_live(query_api, bucket, site_id, device_id):
     """
-    Internal: fetches the main breaker's dido_05 digital input, live.
-    Only present on the main site's DIDO device — optional, same -10m
-    snapshot pattern as _query_weather_live.
-    Returns {'dido_05': 1.0 or 0.0} or {} if no recent data.
+    Main breaker + service status via Grafana-parity logic.
+
+    Fetches dido_01 (breaker on), dido_03 (breaker trip), and dido_05
+    (in service) in one pivoted query, then decodes each signal on the
+    record's OWN timestamp — a point older than STALE_AFTER_SECONDS is
+    treated as offline, exactly like Grafana's date.sub(now(), 15m) check.
+
+    Two independent signals, surfaced as two fields:
+        breaker_status : 'on' | 'trip' | 'off' | 'offline' | None
+        service_status : 'in_service' | 'out_of_service' | 'offline' | None
+
+    Precedence on breaker_status matches Grafana: trip wins over on.
+
+    Returns {} only if no data at all in the window (device never seen).
     """
     flux = f'''
+        import "date"
+
         from(bucket: "{bucket}")
-            |> range(start: -10m)
+            |> range(start: -15m)
             |> filter(fn: (r) => r._measurement == "solar_data")
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => r.device == "{device_id}")
-            |> filter(fn: (r) => r._field == "dido_05")
-            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> filter(fn: (r) =>
+                r._field == "dido_01" or
+                r._field == "dido_03" or
+                r._field == "dido_05"
+            )
             |> last()
+            |> pivot(rowKey: ["device", "_time"], columnKey: ["_field"], valueColumn: "_value")
+            |> map(fn: (r) => ({{
+                _time: r._time,
+                breaker_code:
+                  if r._time < date.sub(from: now(), d: {STALE_AFTER_SECONDS}s) then 3
+                  else if exists r.dido_03 and int(v: r.dido_03) == 1 then 2
+                  else if exists r.dido_01 and int(v: r.dido_01) == 1 then 1
+                  else 0,
+                service_code:
+                  if r._time < date.sub(from: now(), d: {STALE_AFTER_SECONDS}s) then 6
+                  else if exists r.dido_05 and int(v: r.dido_05) == 1 then 5
+                  else 4,
+            }}))
     '''
 
-    tables       = query_api.query(flux, org=INFLUX_ORG)
-    breaker_data = {}
+    tables = query_api.query(flux, org=INFLUX_ORG)
 
+    breaker_code = None
+    service_code = None
     for table in tables:
         for record in table.records:
-            breaker_data[record.get_field()] = record.get_value()
+            breaker_code = int(record.values.get('breaker_code'))
+            service_code = int(record.values.get('service_code'))
 
-    return breaker_data
+    if breaker_code is None:
+        return {}
+
+    breaker_map = {0: 'off', 1: 'on', 2: 'trip', 3: 'offline'}
+    service_map = {4: 'out_of_service', 5: 'in_service', 6: 'offline'}
+
+    return {
+        'breaker_status': breaker_map.get(breaker_code),
+        'service_status': service_map.get(service_code),
+    }
 
 
 def get_dashboard_overview(bucket, site_id, inverter_ids, meter_id, interval_minutes=5):
@@ -523,6 +579,8 @@ def _query_meter_live(query_api, bucket, site_id, meter_id):
 
     for table in tables:
         for record in table.records:
+            if not _is_fresh(record.get_time()):
+                continue
             meter_data[record.get_field()] = record.get_value()
 
     return meter_data
@@ -559,9 +617,13 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
     for table in tables:
         for record in table.records:
             device = record.values.get('device')
-            field  = record.get_field()
-            value  = record.get_value()
             time   = record.get_time()
+
+            if not _is_fresh(time):
+                continue
+
+            field = record.get_field()
+            value = record.get_value()
 
             if device not in device_data:
                 device_data[device] = {}
@@ -870,7 +932,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         co2_avoided_today_kg = round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
 
         return {
-            'last_updated': inv_times and max(
+            'last_updated': max(
                 (t for t in inv_times.values() if t),
                 default=None
             ),
@@ -919,11 +981,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'co2_avoided_today_kg':   co2_avoided_today_kg,
             },
             
-            'breaker_status': (
-                'on' if breaker_fields.get('dido_05') == 1.0 else
-                'off' if breaker_fields.get('dido_05') == 0.0 else
-                None
-            ),
+            'breaker_status': breaker_fields.get('breaker_status'),
+            'service_status': breaker_fields.get('service_status'),
         }
 
     except Exception as e:
@@ -1723,6 +1782,8 @@ def _query_installer_live_snapshot(query_api, bucket, site_meter_map, site_inver
     raw = {}  # { (site_tag, device_tag): { field: value, _time: time } }
     for table in tables:
         for record in table.records:
+            if not _is_fresh(record.get_time()):
+                continue
             key = (record.values.get('site'), record.values.get('device'))
             if key not in raw:
                 raw[key] = {}
@@ -1935,13 +1996,14 @@ def _query_weather_live(query_api, bucket, site_id, device_id):
  
     tables       = query_api.query(flux, org=INFLUX_ORG)
     weather_data = {}
- 
+
     for table in tables:
         for record in table.records:
+            if not _is_fresh(record.get_time()):
+                continue
             weather_data[record.get_field()] = record.get_value()
- 
-    return weather_data
 
+    return weather_data
 
 def _query_poa_irradiation(query_api, bucket, site_id, device_id, start):
     """
