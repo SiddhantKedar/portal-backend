@@ -1,8 +1,7 @@
 # apps/influx/urls.py
 
 from django.urls import path
-from .views import SystemHealthView, SystemHealthLatestView
-from .dashboard_views import DashboardOverviewView, DailyEnergyView, PlantOverviewView, PlantPowerTrendView, PlantElectricalTrendView
+from .dashboard_views import PlantOverviewView, PlantPowerTrendView, PlantElectricalTrendView
 
 from .inverter_views import InverterOverviewView, InverterPowerTrendView
 from .inverter_detail_views import InverterDetailView, InverterDetailPowerTrendView, InverterDailyEnergyView
@@ -13,10 +12,6 @@ from .installer_views import InstallerOverviewView
 from .weather_views import WeatherSnapshotView
 
 urlpatterns = [
-    path('system-health/',          SystemHealthView.as_view(),       name='system-health'),
-    path('system-health/latest/',   SystemHealthLatestView.as_view(), name='system-health-latest'),
-    path('dashboard/overview/',     DashboardOverviewView.as_view(),  name='dashboard-overview'),
-    path('dashboard/daily-energy/', DailyEnergyView.as_view(),        name='daily-energy'),
      # Plant overview page
     path('plant/overview/',         PlantOverviewView.as_view(),      name='plant-overview'),
     path('plant/power-trend/',      PlantPowerTrendView.as_view(),    name='plant-power-trend'),
