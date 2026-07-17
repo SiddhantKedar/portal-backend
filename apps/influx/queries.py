@@ -916,7 +916,14 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
 
         total_inverters = len(inverter_ids)
         poa_kwh_m2      = round(poa_wh_m2 / 1000.0, 4)
-        active_power_kw = abs(round(meter_live.get('active_power_total_kw', 0.0), 2))
+        # Plant Overview only: raw meter value is negative during export (normal
+        # generation). We only want to show 0 when the meter is drawing power
+        # (importing, i.e. raw value positive) rather than a negative number.
+        raw_active_power = meter_live.get('active_power_total_kw', 0.0)
+        if raw_active_power > 0:
+            active_power_kw = 0.0
+        else:
+            active_power_kw = round(raw_active_power * -1, 2)
 
         performance_ratio_pct = None
         if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
