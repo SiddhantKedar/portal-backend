@@ -255,6 +255,100 @@ def _query_breaker_live(query_api, bucket, site_id, device_id):
     }
 
 
+def get_dashboard_overview(bucket, site_id, inverter_ids, meter_id, interval_minutes=5):
+    """
+    Main dashboard overview — single function, three internal queries.
+    Returns everything the plant overview page needs in one call.
+
+    Args:
+        bucket           : InfluxDB bucket (from Customer.influx_bucket)
+        site_id          : site tag (from Site.influx_site_id)
+        inverter_ids     : list of inverter device tags
+        meter_id         : plant meter device tag
+        interval_minutes : power trend aggregation window
+
+    Returns a single dict with plant, grid, inverters and power_trend.
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    try:
+        # Fire all three queries
+        inverter_data, inverter_times = _query_inverter_snapshot(
+            query_api, bucket, site_id, inverter_ids
+        )
+        meter_data = _query_meter_snapshot(
+            query_api, bucket, site_id, meter_id
+        )
+        power_trend = _query_power_trend(
+            query_api, bucket, site_id, inverter_ids, interval_minutes
+        )
+
+        client.close()
+
+        # ── Aggregate inverter values ──────────────────────────────────────────
+        total_active_power  = 0.0
+        total_daily_gen     = 0.0
+        grid_freq           = None
+        power_factor        = None
+        last_updated        = None
+
+        inverter_list = []
+
+        for device_id in inverter_ids:
+            fields = inverter_data.get(device_id, {})
+            t      = inverter_times.get(device_id)
+
+            total_active_power += fields.get('ac_active_power_kw', 0.0)
+            total_daily_gen    += fields.get('energy_daily_kwh', 0.0)
+
+            if grid_freq is None:
+                grid_freq    = fields.get('grid_frequency_hz')
+            if power_factor is None:
+                power_factor = fields.get('ac_power_factor')
+            if last_updated is None or (t and t > last_updated):
+                last_updated = t
+
+            inverter_list.append({
+                'device_id':       device_id,
+                'active_power_kw': round(fields.get('ac_active_power_kw', 0.0), 2),
+                'daily_gen_kwh':   round(fields.get('energy_daily_kwh', 0.0), 3),
+                'internal_temp_c':    round(fields.get('internal_temp_c', 0.0), 1),
+                'inverter_efficiency_pct':      round(fields.get('inverter_efficiency_pct', 0.0), 1),
+                'status':          'online' if fields else 'offline',
+                'last_updated':    t.isoformat() if t else None,
+            })
+
+        # ── Assemble final response ────────────────────────────────────────────
+        return {
+            'last_updated': last_updated.isoformat() if last_updated else None,
+
+            'plant': {
+                'active_power_kw':    round(total_active_power, 2),
+                'reactive_power_kvar': round(meter_data.get('reactive_power_total_kvar', 0.0), 2),
+                'energy_today_kwh':   round(total_daily_gen, 3),
+                'frequency_hz':       round(grid_freq, 2) if grid_freq else None,
+                'power_factor':       round(power_factor, 2) if power_factor else None,
+            },
+
+            'grid': {
+                'current_a':    round(meter_data.get('current_phase_a', 0.0), 2),
+                'current_b':    round(meter_data.get('current_phase_b', 0.0), 2),
+                'current_c':    round(meter_data.get('current_phase_c', 0.0), 2),
+                'voltage_ab':   round(meter_data.get('voltage_line_ab_v', 0.0), 3),
+                'voltage_bc':   round(meter_data.get('voltage_line_bc_v', 0.0), 3),
+                'voltage_ca':   round(meter_data.get('voltage_line_ca_v', 0.0), 3),
+            },
+
+            'inverters':    inverter_list,
+            'power_trend':  power_trend,
+        }
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Dashboard overview query failed: {str(e)}')
+
+
 # ── Daily Energy (Separate Endpoint) ──────────────────────────────────────────
 
 def get_daily_energy(bucket, site_id, meter_id, days=7):
@@ -510,7 +604,7 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
             |> filter(fn: (r) =>
                 r._field == "ac_active_power_kw" or
                 r._field == "energy_daily_kwh" or
-                r.field == "dc_input_power_kw"
+                r._field == "dc_input_power_kw"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -825,7 +919,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         active_power_kw = abs(round(meter_live.get('active_power_total_kw', 0.0), 2))
 
         performance_ratio_pct = None
-        if dc_capacity_kw and poa_kwh_m2 > 0:
+        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
             performance_ratio_pct = round(
                 (energy_today / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
@@ -1059,7 +1153,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             total_daily_gen    += daily_gen
 
             inverter_pr_pct = None
-            if dc_capacity_per_inverter and poa_kwh_m2 > 0:
+            if dc_capacity_per_inverter and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
                 inverter_pr_pct = round(
                     (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
                 )
@@ -1079,7 +1173,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             })
 
         fleet_pr_pct = None
-        if dc_capacity_kw and poa_kwh_m2 > 0:
+        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
             fleet_pr_pct = round(
                 (total_daily_gen / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
@@ -1238,7 +1332,7 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
         daily_gen    = abs(round(fields.get('energy_daily_kwh', 0.0), 3))
 
         performance_ratio_pct = None
-        if dc_capacity_per_inverter and poa_kwh_m2 > 0:
+        if dc_capacity_per_inverter and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
             performance_ratio_pct = round(
                 (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
             )
@@ -1344,7 +1438,7 @@ def get_inverter_daily_energy(bucket, site_id, device_id, days=7):
     """
     client    = get_influx_client()
     query_api = client.query_api()
-    start     = get_n_days_ago_midnight_utc(days)
+    start     = get_n_days_ago_midnight_utc(days - 1)
     ist_offset = '5h30m'
 
     flux = f'''

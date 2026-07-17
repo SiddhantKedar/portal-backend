@@ -64,6 +64,8 @@ class SiteListView(TenantFilterMixin, APIView):
     Returns list of sites the logged in user can see.
     Supports optional filtering by customer:
     GET /api/v1/sites/?customer=1
+    And optional filtering by site type:
+    GET /api/v1/sites/?site_type=GENERATION
     """
     permission_classes = [IsAnyRole]
 
@@ -74,6 +76,11 @@ class SiteListView(TenantFilterMixin, APIView):
         customer_id = request.query_params.get('customer')
         if customer_id:
             sites = sites.filter(customer_id=customer_id)
+
+        # Optional filter by site type from query param
+        site_type = request.query_params.get('site_type')
+        if site_type:
+            sites = sites.filter(site_type=site_type)
 
         serializer = SiteListSerializer(sites, many=True)
         return Response(serializer.data)

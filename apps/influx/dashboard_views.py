@@ -11,8 +11,69 @@ from core.permissions import IsAnyRole
 from core.mixins import TenantFilterMixin
 from apps.sites.models import Device
 
-from .queries import get_plant_overview, get_plant_power_trend, get_plant_electrical_trend
+from .queries import get_daily_energy, get_plant_overview, get_plant_power_trend, get_plant_electrical_trend
 
+
+class DailyEnergyView(TenantFilterMixin, APIView):
+    """
+    GET /api/v1/dashboard/daily-energy/?site=1&days=7
+    Returns daily generation for the last N days.
+    Used for the bar chart — call once on page load, not on every poll.
+    """
+    permission_classes = [IsAnyRole]
+
+    def get(self, request):
+        site_id = request.query_params.get('site')
+        days    = int(request.query_params.get('days', 7))
+
+        if not site_id:
+            return Response(
+                {'detail': 'site param is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Cap at 30 days max
+        if days > 30:
+            days = 30
+
+        try:
+            site = self.get_filtered_sites().get(pk=site_id)
+        except Exception:
+            return Response(
+                {'detail': 'Site not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        meter = Device.objects.filter(
+            site=site, device_type='METER', is_active=True, name='HT Meter'
+        ).first()
+        if not meter:
+            return Response(
+                {'detail': 'No HT meter found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        bucket = site.customer.influx_bucket
+
+        try:
+            data = get_daily_energy(
+                bucket   = bucket,
+                site_id  = site.influx_site_id,
+                meter_id = meter.influx_device_id,
+                days     = days,
+            )
+            return Response({
+                'site': site.name,
+                'days': days,
+                'data': data,
+            })
+
+        except Exception as e:
+            return Response(
+                {'detail': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
 
 class PlantOverviewView(TenantFilterMixin, APIView):
     """
