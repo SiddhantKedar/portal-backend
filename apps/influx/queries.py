@@ -604,7 +604,7 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
             |> filter(fn: (r) =>
                 r._field == "ac_active_power_kw" or
                 r._field == "energy_daily_kwh" or
-                r.field == "dc_input_power_kw"
+                r._field == "dc_input_power_kw"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -878,9 +878,10 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         inv_data, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
 
         weather_fields = {}
+        weather_time   = None
         poa_wh_m2      = 0.0
         if weather_device_id:
-            weather_fields = _query_weather_live(query_api, bucket, site_id, weather_device_id)
+            weather_fields, weather_time = _query_weather_live(query_api, bucket, site_id, weather_device_id)
             poa_wh_m2      = _query_poa_irradiation(
                 query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
             )
@@ -915,10 +916,17 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
 
         total_inverters = len(inverter_ids)
         poa_kwh_m2      = round(poa_wh_m2 / 1000.0, 4)
-        active_power_kw = abs(round(meter_live.get('active_power_total_kw', 0.0), 2))
+        # Plant Overview only: raw meter value is negative during export (normal
+        # generation). We only want to show 0 when the meter is drawing power
+        # (importing, i.e. raw value positive) rather than a negative number.
+        raw_active_power = meter_live.get('active_power_total_kw', 0.0)
+        if raw_active_power > 0:
+            active_power_kw = 0.0
+        else:
+            active_power_kw = round(raw_active_power * -1, 2)
 
         performance_ratio_pct = None
-        if dc_capacity_kw and poa_kwh_m2 > 0:
+        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
             performance_ratio_pct = round(
                 (energy_today / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
@@ -971,6 +979,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'ambient_temp_c':           round(weather_fields.get('ambient_temp_c', 0.0), 2),
                 'module_temp_c':            round(weather_fields.get('module_temp_c', 0.0), 2),
                 'status':                   'online' if weather_fields else 'offline',
+                'last_updated':             weather_time.isoformat() if weather_time else None,
             },
 
             'performance': {
@@ -1110,6 +1119,9 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
 
         for table in tables:
             for record in table.records:
+                if not _is_fresh(record.get_time()):
+                    continue
+
                 device = record.values.get('device')
                 field  = record.get_field()
                 value  = record.get_value()
@@ -1148,7 +1160,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             total_daily_gen    += daily_gen
 
             inverter_pr_pct = None
-            if dc_capacity_per_inverter and poa_kwh_m2 > 0:
+            if dc_capacity_per_inverter and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
                 inverter_pr_pct = round(
                     (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
                 )
@@ -1168,7 +1180,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             })
 
         fleet_pr_pct = None
-        if dc_capacity_kw and poa_kwh_m2 > 0:
+        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
             fleet_pr_pct = round(
                 (total_daily_gen / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
@@ -1314,6 +1326,9 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
 
         for table in tables:
             for record in table.records:
+                if not _is_fresh(record.get_time()):
+                    continue
+
                 fields[record.get_field()] = record.get_value()
                 t = record.get_time()
                 if last_time is None or t > last_time:
@@ -1324,7 +1339,7 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
         daily_gen    = abs(round(fields.get('energy_daily_kwh', 0.0), 3))
 
         performance_ratio_pct = None
-        if dc_capacity_per_inverter and poa_kwh_m2 > 0:
+        if dc_capacity_per_inverter and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
             performance_ratio_pct = round(
                 (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
             )
@@ -1430,7 +1445,7 @@ def get_inverter_daily_energy(bucket, site_id, device_id, days=7):
     """
     client    = get_influx_client()
     query_api = client.query_api()
-    start     = get_n_days_ago_midnight_utc(days)
+    start     = get_n_days_ago_midnight_utc(days - 1)
     ist_offset = '5h30m'
 
     flux = f'''
@@ -1475,6 +1490,9 @@ def get_all_inverters_pv_strings(bucket, site_id, inverter_ids):
     """
     Fetches PV string currents for every inverter at a site in a single query.
     Returns { 'inverter1': { '01': 11.40, '02': 0.0, ... }, 'inverter2': {...}, ... }
+    Stale readings (older than STALE_AFTER_SECONDS) are dropped rather than
+    shown as a last-known value, matching the same rule as every other
+    live snapshot in this file.
     """
     client    = get_influx_client()
     query_api = client.query_api()
@@ -1502,6 +1520,9 @@ def get_all_inverters_pv_strings(bucket, site_id, inverter_ids):
 
         for table in tables:
             for record in table.records:
+                if not _is_fresh(record.get_time()):
+                    continue
+
                 device = record.values.get('device')
                 match  = re.match(r'^pv_string_(\d+)_current_a$', record.get_field())
                 if match and device in device_pv_data:
@@ -1512,7 +1533,6 @@ def get_all_inverters_pv_strings(bucket, site_id, inverter_ids):
     except Exception as e:
         client.close()
         raise Exception(f'PV strings query failed: {str(e)}')
-    
 
     # ── Meter Overview Query ───────────────────────────────────────────────────────
 
@@ -1596,6 +1616,10 @@ def get_meter_overview(bucket, sites_with_meters):
 
             for table in tables:
                 for record in table.records:
+
+                    if not _is_fresh(record.get_time()):
+                        continue
+
                     device = record.values.get('device')
                     field  = record.get_field()
                     value  = record.get_value()
@@ -1914,44 +1938,15 @@ def get_installer_overview(bucket_groups):
 def get_weather_snapshot(bucket, site_id, device_id):
     """
     Live snapshot for the weather station page.
-    Single last() query over -10m for all 7 fields.
+    Delegates to the shared _query_weather_live (staleness-gated),
+    so this page and get_plant_overview never disagree on what "online" means.
     """
     client    = get_influx_client()
     query_api = client.query_api()
 
-    flux = f'''
-        from(bucket: "{bucket}")
-            |> range(start: -10m)
-            |> filter(fn: (r) => r._measurement == "solar_data")
-            |> filter(fn: (r) => r.site == "{site_id}")
-            |> filter(fn: (r) => r.device == "{device_id}")
-            |> filter(fn: (r) =>
-                r._field == "irradiation_inclined_wm2" or
-                r._field == "ambient_temp_c"           or
-                r._field == "module_temp_c"            or
-                r._field == "wind_speed_ms"            or
-                r._field == "wind_direction_deg"       or
-                r._field == "pressure_hpa"             or
-                r._field == "rain_mm"                  or
-                r._field == "humidity_pct"
-            )
-            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-            |> last()
-    '''
-
     try:
-        tables    = query_api.query(flux, org=INFLUX_ORG)
+        fields, last_time = _query_weather_live(query_api, bucket, site_id, device_id)
         client.close()
-
-        fields    = {}
-        last_time = None
-
-        for table in tables:
-            for record in table.records:
-                fields[record.get_field()] = record.get_value()
-                t = record.get_time()
-                if last_time is None or t > last_time:
-                    last_time = t
 
         is_online = bool(fields)
 
@@ -1975,9 +1970,9 @@ def get_weather_snapshot(bucket, site_id, device_id):
 
 def _query_weather_live(query_api, bucket, site_id, device_id):
     """
-    Internal: fetches the 3 weather fields needed on plant overview.
-    Same -10m snapshot pattern as _query_meter_live.
-    Returns flat dict of field → value (empty dict if station offline).
+    Internal: fetches live weather station fields, gated on staleness.
+    Returns (fields, last_time) — fields is {} and last_time is None
+    if no fresh data was found.
     """
     flux = f'''
         from(bucket: "{bucket}")
@@ -1988,22 +1983,32 @@ def _query_weather_live(query_api, bucket, site_id, device_id):
             |> filter(fn: (r) =>
                 r._field == "irradiation_inclined_wm2" or
                 r._field == "ambient_temp_c"           or
-                r._field == "module_temp_c"
+                r._field == "module_temp_c"            or
+                r._field == "wind_speed_ms"            or
+                r._field == "wind_direction_deg"       or
+                r._field == "pressure_hpa"             or
+                r._field == "rain_mm"                  or
+                r._field == "humidity_pct"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
     '''
- 
+
     tables       = query_api.query(flux, org=INFLUX_ORG)
     weather_data = {}
+    last_time    = None
 
     for table in tables:
         for record in table.records:
             if not _is_fresh(record.get_time()):
                 continue
-            weather_data[record.get_field()] = record.get_value()
 
-    return weather_data
+            weather_data[record.get_field()] = record.get_value()
+            t = record.get_time()
+            if last_time is None or t > last_time:
+                last_time = t
+
+    return weather_data, last_time
 
 def _query_poa_irradiation(query_api, bucket, site_id, device_id, start):
     """

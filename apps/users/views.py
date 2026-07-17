@@ -8,14 +8,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 
 from .serializers import UserSerializer, LoginSerializer
+from apps.sites.models import Site
+from apps.sites.serializers import SiteListSerializer
 
 
 class LoginView(APIView):
-    """
-    Takes email and password.
-    Returns access token, refresh token and user details.
-    """
-    permission_classes = [AllowAny]     # only public endpoint, no auth needed
+    permission_classes = [AllowAny]
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
@@ -26,7 +24,6 @@ class LoginView(APIView):
         email    = serializer.validated_data['email']
         password = serializer.validated_data['password']
 
-        # authenticate checks email/password against database
         user = authenticate(request, username=email, password=password)
 
         if not user:
@@ -41,15 +38,27 @@ class LoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # Generate JWT tokens for this user
         refresh = RefreshToken.for_user(user)
+
+        # Resolve GENERATION sites this user can see, same role logic as
+        # TenantFilterMixin.get_filtered_sites — inlined here since this is
+        # a one-time call at login, not worth wiring the mixin into a
+        # non-DRF-viewset APIView for this alone.
+        if user.role == 'ADMIN':
+            sites = Site.objects.filter(site_type='GENERATION')
+        elif user.role == 'INSTALLER':
+            sites = Site.objects.filter(installer=user.installer, site_type='GENERATION')
+        elif user.role == 'CUSTOMER':
+            sites = Site.objects.filter(customer=user.customer, site_type='GENERATION')
+        else:
+            sites = Site.objects.none()
 
         return Response({
             'access':  str(refresh.access_token),
             'refresh': str(refresh),
-            'user':    UserSerializer(user).data
+            'user':    UserSerializer(user).data,
+            'sites':   SiteListSerializer(sites, many=True).data,
         }, status=status.HTTP_200_OK)
-
 
 class LogoutView(APIView):
     """
