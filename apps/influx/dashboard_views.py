@@ -143,6 +143,7 @@ class PlantOverviewView(TenantFilterMixin, APIView):
                 dido_device_id     = dido_device.influx_device_id if dido_device else None,
                 dc_capacity_kw     = site.dc_capacity_kw,
                 ac_capacity_kw     = site.ac_capacity_kw,
+                daily_generation_target_kwh = site.daily_generation_target_kwh,
                 meter_energy_offset_kwh = float(meter.energy_offset_kwh),
             )
 
