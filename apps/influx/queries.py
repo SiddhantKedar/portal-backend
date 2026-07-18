@@ -15,7 +15,7 @@ INFLUX_ORG = os.getenv('INFLUX_ORG')
 # (Nov 2025). Update when CEA publishes a new edition.
 CO2_AVOIDED_FACTOR_KG_PER_KWH = 0.71
 
-MIN_POA_KWH_M2_FOR_PR = 0.1
+MIN_POA_KWH_M2_FOR_PR = 0.5
 
 # Determine when to show device is offline
 STALE_AFTER_SECONDS = 120
@@ -836,7 +836,7 @@ def _resolve_ist_date_range(date_str):
     return start_str, end_str
 
 
-def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0):
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None):
     """
     Plant overview — single function, four or five internal queries.
     Returns everything for the plant overview page stat cards,
@@ -952,6 +952,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'power_factor':     round(meter_live.get('power_factor_total', 0.0), 2),
                 'dc_capacity_kw':   float(dc_capacity_kw) if dc_capacity_kw else None,
                 'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
+                'daily_generation_target_kwh': float(daily_generation_target_kwh) if daily_generation_target_kwh else None,
                 'energy_active_export_kwh': round(
                     meter_live.get('energy_active_export_kwh', 0.0) + meter_energy_offset_kwh, 2
                 ) if meter_live else 0.0,
@@ -1064,17 +1065,82 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
         raise Exception(f'Plant power trend query failed: {str(e)}')
     
 
-    # ── Inverter Overview Queries ──────────────────────────────────────────────────
+# ── Inverter Overview Queries ──────────────────────────────────────────────────
+
+def _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids):
+    """
+    Internal: today's generation per inverter, derived the same way as the
+    meter — last minus first of energy_total_kwh (lifetime counter) since
+    IST midnight. Replaces energy_daily_kwh on sites where that field isn't
+    populated. Grouped by device so N inverters cost one query pair, not N.
+
+    Returns { device_id: energy_kwh_today }. Missing/incomplete pairs are
+    omitted from the dict (caller should .get(id, 0.0)).
+    """
+    start = get_ist_midnight_utc()
+    device_filter = ' or '.join(
+        [f'r.device == "{d}"' for d in inverter_ids]
+    )
+
+    flux_first = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "energy_total_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> group(columns: ["device"])
+            |> first()
+    '''
+
+    flux_last = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "energy_total_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> group(columns: ["device"])
+            |> last()
+    '''
+
+    first_vals = {}
+    last_vals  = {}
+
+    tables = query_api.query(flux_first, org=INFLUX_ORG)
+    for table in tables:
+        for record in table.records:
+            first_vals[record.values.get('device')] = record.get_value()
+
+    tables = query_api.query(flux_last, org=INFLUX_ORG)
+    for table in tables:
+        for record in table.records:
+            last_vals[record.values.get('device')] = record.get_value()
+
+    result = {}
+    for device_id in inverter_ids:
+        f = first_vals.get(device_id)
+        l = last_vals.get(device_id)
+        if f is not None and l is not None:
+            result[device_id] = round(l - f, 3)
+
+    return result
 
 def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None, dc_capacity_kw=None):
     """
     Fetches all live inverter data in one query.
     Returns summary (totals) + per inverter breakdown.
 
-    Fields fetched per inverter:
-        ac_active_power_kw, energy_daily_kwh, energy_total_kwh,
+    Fields fetched per inverter (live snapshot):
+        ac_active_power_kw, energy_total_kwh,
         grid_frequency_hz, ac_power_factor, ac_reactive_power_kvar,
         inverter_efficiency_pct
+
+    Daily energy is NOT read from energy_daily_kwh (unreliable/self-resetting,
+    and absent entirely on newer sites). Derived instead as last-minus-first
+    of energy_total_kwh since IST midnight, same pattern as the meter.
     """
     client    = get_influx_client()
     query_api = client.query_api()
@@ -1091,7 +1157,6 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             |> filter(fn: (r) => {device_filter})
             |> filter(fn: (r) =>
                 r._field == "ac_active_power_kw"      or
-                r._field == "energy_daily_kwh"         or
                 r._field == "energy_total_kwh"         or
                 r._field == "grid_frequency_hz"        or
                 r._field == "ac_power_factor"          or
@@ -1111,6 +1176,11 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
             )
             poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
+
+        daily_energy_by_device = _query_inverters_today_energy(
+            query_api, bucket, site_id, inverter_ids
+        )
+
         client.close()
 
         # Collect per device
@@ -1154,7 +1224,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 online_count += 1
 
             active_power = abs(round(fields.get('ac_active_power_kw', 0.0), 2))
-            daily_gen    = abs(round(fields.get('energy_daily_kwh', 0.0), 3))
+            daily_gen    = abs(daily_energy_by_device.get(device_id, 0.0))
 
             total_active_power += active_power
             total_daily_gen    += daily_gen
@@ -1168,7 +1238,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             inverter_list.append({
                 'device_id':               device_id,
                 'ac_active_power_kw':      active_power,
-                'energy_daily_kwh':        daily_gen,
+                'energy_daily_kwh':        round(daily_gen, 3),
                 'energy_total_kwh':        abs(round(fields.get('energy_total_kwh', 0.0), 2)),
                 'ac_reactive_power_kvar':  abs(round(fields.get('ac_reactive_power_kvar', 0.0), 2)),
                 'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
@@ -1284,6 +1354,10 @@ def get_inverter_power_trend(bucket, site_id, inverter_ids, date_str=None, inter
 # ── Inverter Detail Page Queries ──────────────────────────────────────────────
 
 def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_capacity_per_inverter=None):
+    """
+    Daily energy is derived (last-minus-first of energy_total_kwh since IST
+    midnight), not read from energy_daily_kwh — see get_inverter_overview.
+    """
     client    = get_influx_client()
     query_api = client.query_api()
 
@@ -1295,8 +1369,7 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
             |> filter(fn: (r) => r.device == "{device_id}")
             |> filter(fn: (r) =>
                 r._field == "ac_active_power_kw"      or
-                r._field == "energy_daily_kwh"        or
-                r._field == "energy_total_kwh"        or
+                r._field == "energy_total_kwh"         or
                 r._field == "ac_power_factor"         or
                 r._field == "inverter_efficiency_pct" or
                 r._field == "grid_frequency_hz"       or
@@ -1312,13 +1385,18 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
 
     try:
         tables = query_api.query(flux, org=INFLUX_ORG)
-        
+
         poa_kwh_m2 = 0.0
         if weather_device_id:
             poa_wh_m2  = _query_poa_irradiation(
                 query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
             )
             poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
+
+        daily_energy_by_device = _query_inverters_today_energy(
+            query_api, bucket, site_id, [device_id]
+        )
+
         client.close()
 
         fields    = {}
@@ -1336,18 +1414,18 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
 
         is_online    = bool(fields)
         active_power = abs(round(fields.get('ac_active_power_kw', 0.0), 2))
-        daily_gen    = abs(round(fields.get('energy_daily_kwh', 0.0), 3))
+        daily_gen    = abs(daily_energy_by_device.get(device_id, 0.0))
 
         performance_ratio_pct = None
         if dc_capacity_per_inverter and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
             performance_ratio_pct = round(
                 (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
             )
-        
+
         return {
             'device_id':               device_id,
             'ac_active_power_kw':      active_power,
-            'energy_daily_kwh':        daily_gen,
+            'energy_daily_kwh':        round(daily_gen, 3),
             'energy_total_kwh':        abs(round(fields.get('energy_total_kwh', 0.0), 2)),
             'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
             'inverter_efficiency_pct': round(fields.get('inverter_efficiency_pct', 0.0), 1),
@@ -1365,8 +1443,7 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
 
     except Exception as e:
         client.close()
-        raise Exception(f'Inverter detail query failed: {str(e)}')
-    
+        raise Exception(f'Inverter detail query failed: {str(e)}')    
 
 def get_inverter_detail_power_trend(bucket, site_id, device_id, date_str=None, interval_minutes=5):
     """
