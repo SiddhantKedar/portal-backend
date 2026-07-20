@@ -8,7 +8,7 @@ from .inverter_detail_views import InverterDetailView, InverterDetailPowerTrendV
 from .pv_strings_views import InverterPvStringsView
 from .meter_views import MeterOverviewView
 from .analytics_views import AnalyticsMetricsListView, AnalyticsView
-from .installer_views import InstallerOverviewView
+from .portfolio_view import PortfolioOverviewView
 from .weather_views import WeatherSnapshotView
 
 urlpatterns = [
@@ -37,8 +37,12 @@ urlpatterns = [
     path('analytics/', AnalyticsView.as_view()),
     path('analytics/metrics/', AnalyticsMetricsListView.as_view()),
 
-    # Installer overview
-    path('installer/overview/', InstallerOverviewView.as_view()),
+    # Portfolio overview — role-neutral landing page (ADMIN / INSTALLER / CUSTOMER)
+    path('portfolio/overview/', PortfolioOverviewView.as_view(), name='portfolio-overview'),
+
+    # Deprecated alias — kept alive so the frontend can cut over independently.
+    # Delete once InstallerOverviewPage points at /portfolio/overview/.
+    path('installer/overview/', PortfolioOverviewView.as_view()),
 
     # Weather station Page
     path('weather/', WeatherSnapshotView.as_view()),
