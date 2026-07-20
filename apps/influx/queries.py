@@ -1853,21 +1853,35 @@ def get_analytics_data(bucket, site_id, series_map, date_str=None, interval_minu
         raise Exception(f'Analytics query failed: {str(e)}')
     
 
-# ── Installer Overview Queries ─────────────────────────────────────────────────
+# ── Portfolio Overview Queries ─────────────────────────────────────────────────
 
-def _query_installer_live_snapshot(query_api, bucket, site_meter_map, site_inverters_map):
+def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, site_inverters_map):
     """
     Live active power per meter + inverter online count per site, one query.
-    site_meter_map:     { influx_site_id: meter_influx_device_id }
+    site_ids:           [influx_site_id] — ALL sites in this bucket, including meterless ones
+    site_meter_map:     { influx_site_id: meter_influx_device_id }   (may omit sites)
     site_inverters_map: { influx_site_id: [inverter_influx_device_ids] }
-    Returns: { influx_site_id: { active_power_kw, meter_online, inverters_online, inverters_total, last_updated } }
+    Returns: { influx_site_id: { active_power_kw, meter_online, inverters_online,
+                                 inverters_total, last_updated } }
     """
-    site_ids = list(site_meter_map.keys())
-    site_filter   = ' or '.join([f'r.site == "{s}"' for s in site_ids])
+    empty = {
+        'active_power_kw': 0.0, 'meter_online': False,
+        'inverters_online': 0, 'inverters_total': 0, 'last_updated': None,
+    }
+    if not site_ids:
+        return {}
 
-    all_devices   = set(site_meter_map.values())
+    all_devices = set(site_meter_map.values())
     for inv_ids in site_inverters_map.values():
         all_devices.update(inv_ids)
+
+    # A bucket whose sites have no active devices at all would produce an empty
+    # filter expression — invalid Flux. Return the zeroed shape instead.
+    if not all_devices:
+        return {sid: {**empty, 'inverters_total': len(site_inverters_map.get(sid, []))}
+                for sid in site_ids}
+
+    site_filter   = ' or '.join([f'r.site == "{s}"' for s in site_ids])
     device_filter = ' or '.join([f'r.device == "{d}"' for d in all_devices])
 
     flux = f'''
@@ -1915,12 +1929,15 @@ def _query_installer_live_snapshot(query_api, bucket, site_meter_map, site_inver
     return results
 
 
-def _query_installer_energy_today(query_api, bucket, site_meter_map):
+def _query_portfolio_energy_today(query_api, bucket, site_meter_map):
     """
     Energy today (last - first since IST midnight) for all meters in this bucket.
     site_meter_map: { influx_site_id: meter_influx_device_id }
     Returns: { influx_site_id: energy_today_kwh }
     """
+    if not site_meter_map:
+        return {}
+
     site_ids      = list(site_meter_map.keys())
     site_filter   = ' or '.join([f'r.site == "{s}"' for s in site_ids])
     meter_ids     = list(set(site_meter_map.values()))
@@ -1931,33 +1948,33 @@ def _query_installer_energy_today(query_api, bucket, site_meter_map):
     # aggregateWindow(every: 24h, timeSrc: "_start") ensures both first and last
     # share the same _time (IST midnight), so pivot can match them correctly.
     flux = f'''
-        import "timezone"
+    import "timezone"
 
-        option location = timezone.fixed(offset: {ist_offset})
+    option location = timezone.fixed(offset: {ist_offset})
 
-        day_first = from(bucket: "{bucket}")
-            |> range(start: {start})
-            |> filter(fn: (r) => r._measurement == "solar_data")
-            |> filter(fn: (r) => {site_filter})
-            |> filter(fn: (r) => {device_filter})
-            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
-            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-            |> aggregateWindow(every: 24h, fn: first, createEmpty: false, timeSrc: "_start")
-            |> map(fn: (r) => ({{r with _field: "v_first"}}))
+    day_first = from(bucket: "{bucket}")
+        |> range(start: {start})
+        |> filter(fn: (r) => r._measurement == "solar_data")
+        |> filter(fn: (r) => {site_filter})
+        |> filter(fn: (r) => {device_filter})
+        |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+        |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+        |> aggregateWindow(every: 24h, fn: first, createEmpty: false, timeSrc: "_start")
+        |> map(fn: (r) => ({{r with _field: "v_first"}}))
 
-        day_last = from(bucket: "{bucket}")
-            |> range(start: {start})
-            |> filter(fn: (r) => r._measurement == "solar_data")
-            |> filter(fn: (r) => {site_filter})
-            |> filter(fn: (r) => {device_filter})
-            |> filter(fn: (r) => r._field == "energy_active_export_kwh")
-            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-            |> aggregateWindow(every: 24h, fn: last, createEmpty: false, timeSrc: "_start")
-            |> map(fn: (r) => ({{r with _field: "v_last"}}))
+    day_last = from(bucket: "{bucket}")
+        |> range(start: {start})
+        |> filter(fn: (r) => r._measurement == "solar_data")
+        |> filter(fn: (r) => {site_filter})
+        |> filter(fn: (r) => {device_filter})
+        |> filter(fn: (r) => r._field == "energy_active_export_kwh")
+        |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+        |> aggregateWindow(every: 24h, fn: last, createEmpty: false, timeSrc: "_start")
+        |> map(fn: (r) => ({{r with _field: "v_last"}}))
 
-        union(tables: [day_first, day_last])
-            |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-            |> map(fn: (r) => ({{r with _value: r.v_last - r.v_first}}))
+    union(tables: [day_first, day_last])
+        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+        |> map(fn: (r) => ({{r with _value: r.v_last - r.v_first}}))
     '''
 
     tables = query_api.query(flux, org=INFLUX_ORG)
@@ -1975,17 +1992,32 @@ def _query_installer_energy_today(query_api, bucket, site_meter_map):
     }
 
 
-def get_installer_overview(bucket_groups):
+def get_portfolio_overview(bucket_groups, include_energy=True):
     """
-    Fires 2 Flux queries per bucket (live snapshot + energy today).
+    Fires 2 Flux queries per bucket (live snapshot + energy today), or 1 per
+    bucket when include_energy=False.
+
+    include_energy=False drops `energy_today_kwh` (returned as None, never 0.0 —
+    zero would render as "generated nothing today"). This is the expensive half:
+    the energy query reads from IST midnight TWICE (day_first + day_last) while
+    the live query reads 10 minutes once, so by evening it accounts for nearly
+    all of the endpoint's scan cost. Use it for wide-tenancy callers (ADMIN)
+    that only need liveness.
+
     bucket_groups: {
         bucket_str: {
+            'pk_map':        { influx_site_id: site_pk },   # ALL sites in bucket
             'meter_map':     { influx_site_id: meter_influx_device_id },
             'inverters_map': { influx_site_id: [inv_influx_device_ids] },
         }
     }
-    Returns: { influx_site_id: { active_power_kw, energy_today_kwh, meter_online,
-                                  inverters_online, inverters_total, last_updated } }
+    Returns keyed on Site.pk — NOT influx_site_id. influx_site_id is only unique
+    within a customer's bucket, so keying results on it collides across customers
+    (two customers can both use "test"). pk is globally unique; the translation
+    happens here, at the bucket boundary, while bucket context still exists.
+
+    Returns: { site_pk: { active_power_kw, energy_today_kwh, meter_online,
+                          inverters_online, inverters_total, last_updated } }
     """
     client    = get_influx_client()
     query_api = client.query_api()
@@ -1993,27 +2025,29 @@ def get_installer_overview(bucket_groups):
 
     try:
         for bucket, group in bucket_groups.items():
-            live   = _query_installer_live_snapshot(
-                query_api, bucket, group['meter_map'], group['inverters_map']
+            site_ids = list(group['pk_map'].keys())
+
+            live = _query_portfolio_live_snapshot(
+                query_api, bucket, site_ids, group['meter_map'], group['inverters_map']
             )
-            energy = _query_installer_energy_today(
-                query_api, bucket, group['meter_map']
+            energy = (
+                _query_portfolio_energy_today(query_api, bucket, group['meter_map'])
+                if include_energy else {}
             )
 
-            for influx_site_id in group['meter_map']:
-                results[influx_site_id] = {
+            for influx_site_id, site_pk in group['pk_map'].items():
+                results[site_pk] = {
                     **live.get(influx_site_id, {
                         'active_power_kw': 0.0, 'meter_online': False,
                         'inverters_online': 0, 'inverters_total': 0, 'last_updated': None,
                     }),
-                    'energy_today_kwh': energy.get(influx_site_id, 0.0),
+                    'energy_today_kwh': (
+                        energy.get(influx_site_id, 0.0) if include_energy else None
+                    ),
                 }
 
+    finally:
         client.close()
-
-    except Exception as e:
-        client.close()
-        raise Exception(f'Installer overview query failed: {str(e)}')
 
     return results
 
