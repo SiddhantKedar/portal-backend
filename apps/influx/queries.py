@@ -20,6 +20,9 @@ MIN_POA_KWH_M2_FOR_PR = 0.5
 # Determine when to show device is offline
 STALE_AFTER_SECONDS = 120
 
+# For Generation start stop
+GENERATION_STOP_GAP_SECONDS = 120
+
 
 # ── Timezone Helper ────────────────────────────────────────────────────────────
 
@@ -939,6 +942,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
 
         co2_avoided_today_kg = round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
 
+        generation_window = _query_plant_generation_window(query_api, bucket, site_id, meter_id)
+
         return {
             'last_updated': max(
                 (t for t in inv_times.values() if t),
@@ -993,6 +998,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             
             'breaker_status': breaker_fields.get('breaker_status'),
             'service_status': breaker_fields.get('service_status'),
+            'generation_window': generation_window,
         }
 
     except Exception as e:
@@ -2269,3 +2275,91 @@ def _query_inverter_daily_sum_for_day(query_api, bucket, site_id, inverter_ids, 
             count += 1
 
     return round(total, 3), count
+
+
+# Generation Start End (Optimize it later)
+
+def _query_plant_generation_window(query_api, bucket, site_id, meter_id):
+    """
+    Internal: start/end of today's generation window, derived purely from
+    meter active_power_total_kw — independent of the weather station.
+
+    Meter convention: active_power_total_kw is negative while exporting
+    (generating), >= 0 while idle/importing. We use a small negative
+    threshold (not strict < 0) so noise near zero doesn't register as
+    generation.
+
+    start_time: first timestamp today the meter crossed into export.
+    end_time:   depends on state —
+        - still generating, or dipped only briefly (< GENERATION_STOP_GAP_SECONDS
+          since last export) → None, status 'operational'
+        - hasn't exported in over GENERATION_STOP_GAP_SECONDS → frozen at the
+          last export timestamp, status 'stopped'
+        - meter has no fresh data at all (dead/offline) → status 'no_data',
+          start/end reflect whatever was seen before it went dark
+    """
+    start = get_ist_midnight_utc()
+    EXPORT_THRESHOLD_KW = -1.0
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "active_power_total_kw")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+    '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+
+    first_export_time = None
+    last_export_time  = None
+    latest_point_time = None
+
+    for table in tables:
+        for record in table.records:
+            t = record.get_time()
+            v = record.get_value()
+
+            if latest_point_time is None or t > latest_point_time:
+                latest_point_time = t
+
+            if v is not None and v <= EXPORT_THRESHOLD_KW:
+                if first_export_time is None or t < first_export_time:
+                    first_export_time = t
+                if last_export_time is None or t > last_export_time:
+                    last_export_time = t
+
+    now = datetime.now(timezone.utc)
+
+    # Meter isn't reporting at all — can't distinguish night from a dead meter
+    if latest_point_time is None or not _is_fresh(latest_point_time):
+        return {
+            'status':     'no_data',
+            'start_time': first_export_time.isoformat() if first_export_time else None,
+            'end_time':   last_export_time.isoformat() if last_export_time else None,
+        }
+
+    # Meter is alive but has never exported today (before sunrise, or a total washout)
+    if last_export_time is None:
+        return {
+            'status':     'operational',
+            'start_time': None,
+            'end_time':   None,
+        }
+
+    gap_seconds = (now - last_export_time).total_seconds()
+
+    if gap_seconds <= GENERATION_STOP_GAP_SECONDS:
+        return {
+            'status':     'operational',
+            'start_time': first_export_time.isoformat(),
+            'end_time':   None,
+        }
+    else:
+        return {
+            'status':     'stopped',
+            'start_time': first_export_time.isoformat(),
+            'end_time':   last_export_time.isoformat(),
+        }
