@@ -931,7 +931,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             active_power_kw = round(raw_active_power * -1, 2)
 
         performance_ratio_pct = None
-        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
+        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR and weather_fields:
             performance_ratio_pct = round(
                 (energy_today / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
