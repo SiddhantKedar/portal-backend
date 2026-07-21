@@ -195,9 +195,9 @@ def _query_breaker_live(query_api, bucket, site_id, device_id):
     """
     Main breaker + service status via Grafana-parity logic.
 
-    Fetches dido_01 (breaker on), dido_03 (breaker trip), and dido_05
-    (in service) in one pivoted query, then decodes each signal on the
-    record's OWN timestamp — a point older than STALE_AFTER_SECONDS is
+    Fetches di_01 (breaker on), di_02 (breaker off), di_04 (breaker trip),
+    and di_03 (in service) in one pivoted query, then decodes each signal on
+    the record's OWN timestamp — a point older than STALE_AFTER_SECONDS is
     treated as offline, exactly like Grafana's date.sub(now(), 15m) check.
 
     Two independent signals, surfaced as two fields:
@@ -217,9 +217,10 @@ def _query_breaker_live(query_api, bucket, site_id, device_id):
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => r.device == "{device_id}")
             |> filter(fn: (r) =>
-                r._field == "dido_01" or
-                r._field == "dido_03" or
-                r._field == "dido_05"
+                r._field == "di_01" or
+                r._field == "di_02" or
+                r._field == "di_03" or
+                r._field == "di_04"
             )
             |> last()
             |> pivot(rowKey: ["device", "_time"], columnKey: ["_field"], valueColumn: "_value")
@@ -227,13 +228,13 @@ def _query_breaker_live(query_api, bucket, site_id, device_id):
                 _time: r._time,
                 breaker_code:
                   if r._time < date.sub(from: now(), d: {STALE_AFTER_SECONDS}s) then 3
-                  else if exists r.dido_03 and int(v: r.dido_03) == 1 then 2
-                  else if exists r.dido_01 and int(v: r.dido_01) == 1 then 1
+                  else if exists r.di_04 and int(v: r.di_04) == 1 then 2
+                  else if exists r.di_01 and int(v: r.di_01) == 1 then 1
                   else 0,
                 service_code:
-                  if r._time < date.sub(from: now(), d: {STALE_AFTER_SECONDS}s) then 6
-                  else if exists r.dido_05 and int(v: r.dido_05) == 1 then 5
-                  else 4,
+                  if r._time < date.sub(from: now(), d: {STALE_AFTER_SECONDS}s) then 2
+                  else if exists r.di_03 and int(v: r.di_03) == 1 then 1
+                  else 0,
             }}))
     '''
 
@@ -250,7 +251,7 @@ def _query_breaker_live(query_api, bucket, site_id, device_id):
         return {}
 
     breaker_map = {0: 'off', 1: 'on', 2: 'trip', 3: 'offline'}
-    service_map = {4: 'out_of_service', 5: 'in_service', 6: 'offline'}
+    service_map = {0: 'out_of_service', 1: 'in_service', 2: 'offline'}
 
     return {
         'breaker_status': breaker_map.get(breaker_code),
@@ -659,9 +660,10 @@ def _query_plant_power_trend(query_api, bucket, site_id, meter_id, start, end, i
 
     for table in tables:
         for record in table.records:
+            raw = record.get_value() or 0.0
             results.append({
                 'time':     record.get_time().isoformat(),
-                'active_power_total_kw': abs(round(record.get_value() or 0.0, 2)),
+                'active_power_total_kw': round(-raw, 2) if raw < 0 else 0.0,
             })
 
     results.sort(key=lambda x: x['time'])
