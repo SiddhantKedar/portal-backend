@@ -1918,8 +1918,11 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
         meter_rec = raw.get((influx_site_id, meter_id), {}) if meter_id else {}
         last_time = meter_rec.get('_time')
 
+        raw_power = meter_rec.get('active_power_total_kw', 0.0)
+        active_power_kw = 0.0 if raw_power > 0 else round(raw_power * -1, 2)
+
         results[influx_site_id] = {
-            'active_power_kw':  abs(round(meter_rec.get('active_power_total_kw', 0.0), 2)),
+            'active_power_kw':  active_power_kw,
             'meter_online':     bool(meter_rec),
             'inverters_online': sum(1 for inv_id in inv_ids if raw.get((influx_site_id, inv_id))),
             'inverters_total':  len(inv_ids),
