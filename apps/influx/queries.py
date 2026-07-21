@@ -895,6 +895,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         if dido_device_id:
             breaker_fields = _query_breaker_live(query_api, bucket, site_id, dido_device_id)
 
+        generation_window = _query_plant_generation_window(query_api, bucket, site_id, meter_id)
+
         client.close()
 
         # Build inverter list
@@ -931,7 +933,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             active_power_kw = round(raw_active_power * -1, 2)
 
         performance_ratio_pct = None
-        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
+        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR and weather_fields:
             performance_ratio_pct = round(
                 (energy_today / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
@@ -944,7 +946,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
 
         co2_avoided_today_kg = round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
 
-        generation_window = _query_plant_generation_window(query_api, bucket, site_id, meter_id)
+        
 
         return {
             'last_updated': max(
@@ -1149,6 +1151,12 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
     Daily energy is NOT read from energy_daily_kwh (unreliable/self-resetting,
     and absent entirely on newer sites). Derived instead as last-minus-first
     of energy_total_kwh since IST midnight, same pattern as the meter.
+
+    PR requires the weather station to be live right now, not just to have
+    reported earlier today — poa_irradiation_kwh_m2 is a cumulative integral
+    that freezes the moment the station goes offline, while energy keeps
+    climbing. Without a freshness check here, a dead station mid-day inflates
+    PR past 100% instead of correctly reporting it as unavailable.
     """
     client    = get_influx_client()
     query_api = client.query_api()
@@ -1178,12 +1186,16 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
     try:
         tables       = query_api.query(flux, org=INFLUX_ORG)
 
-        poa_kwh_m2 = 0.0
+        poa_kwh_m2     = 0.0
+        weather_is_live = False
         if weather_device_id:
             poa_wh_m2  = _query_poa_irradiation(
                 query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
             )
             poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
+
+            weather_fields, _ = _query_weather_live(query_api, bucket, site_id, weather_device_id)
+            weather_is_live = bool(weather_fields)
 
         daily_energy_by_device = _query_inverters_today_energy(
             query_api, bucket, site_id, inverter_ids
@@ -1223,6 +1235,8 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             if dc_capacity_kw and len(inverter_ids) > 0 else None
         )
 
+        pr_ready = weather_is_live and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR
+
         for device_id in inverter_ids:
             fields    = device_data.get(device_id, {})
             t         = device_times.get(device_id)
@@ -1238,7 +1252,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             total_daily_gen    += daily_gen
 
             inverter_pr_pct = None
-            if dc_capacity_per_inverter and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
+            if dc_capacity_per_inverter and pr_ready:
                 inverter_pr_pct = round(
                     (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
                 )
@@ -1258,7 +1272,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             })
 
         fleet_pr_pct = None
-        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
+        if dc_capacity_kw and pr_ready:
             fleet_pr_pct = round(
                 (total_daily_gen / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
@@ -1278,7 +1292,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
     except Exception as e:
         client.close()
         raise Exception(f'Inverter overview query failed: {str(e)}')
-
+    
 
 def get_inverter_power_trend(bucket, site_id, inverter_ids, date_str=None, interval_minutes=5):
     """
@@ -1365,6 +1379,12 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
     """
     Daily energy is derived (last-minus-first of energy_total_kwh since IST
     midnight), not read from energy_daily_kwh — see get_inverter_overview.
+
+    PR requires the weather station to be live right now, not just to have
+    reported earlier today — poa_irradiation_kwh_m2 is a cumulative integral
+    that freezes the moment the station goes offline, while energy keeps
+    climbing. Without a freshness check here, a dead station mid-day inflates
+    PR past 100% instead of correctly reporting it as unavailable.
     """
     client    = get_influx_client()
     query_api = client.query_api()
@@ -1394,12 +1414,16 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
     try:
         tables = query_api.query(flux, org=INFLUX_ORG)
 
-        poa_kwh_m2 = 0.0
+        poa_kwh_m2      = 0.0
+        weather_is_live = False
         if weather_device_id:
             poa_wh_m2  = _query_poa_irradiation(
                 query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
             )
             poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
+
+            weather_fields, _ = _query_weather_live(query_api, bucket, site_id, weather_device_id)
+            weather_is_live = bool(weather_fields)
 
         daily_energy_by_device = _query_inverters_today_energy(
             query_api, bucket, site_id, [device_id]
@@ -1425,7 +1449,7 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
         daily_gen    = abs(daily_energy_by_device.get(device_id, 0.0))
 
         performance_ratio_pct = None
-        if dc_capacity_per_inverter and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
+        if dc_capacity_per_inverter and weather_is_live and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR:
             performance_ratio_pct = round(
                 (daily_gen / (dc_capacity_per_inverter * poa_kwh_m2)) * 100, 2
             )
@@ -1451,7 +1475,7 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
 
     except Exception as e:
         client.close()
-        raise Exception(f'Inverter detail query failed: {str(e)}')    
+        raise Exception(f'Inverter detail query failed: {str(e)}')  
 
 def get_inverter_detail_power_trend(bucket, site_id, device_id, date_str=None, interval_minutes=5):
     """
