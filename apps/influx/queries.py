@@ -564,6 +564,7 @@ def _query_meter_live(query_api, bucket, site_id, meter_id):
             |> filter(fn: (r) => r.device == "{meter_id}")
             |> filter(fn: (r) =>
                 r._field == "active_power_total_kw"     or
+                r._field == "reactive_power_total_kvar" or
                 r._field == "voltage_line_ab_v"         or
                 r._field == "voltage_line_bc_v"         or
                 r._field == "voltage_line_ca_v"         or
@@ -959,6 +960,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'energy_today_kwh': energy_today,
                 'frequency_hz':     round(meter_live.get('grid_frequency_hz', 0.0), 2),
                 'power_factor':     round(meter_live.get('power_factor_total', 0.0), 2),
+                'reactive_power_kvar': round(meter_live.get('reactive_power_total_kvar', 0.0), 2),
                 'dc_capacity_kw':   float(dc_capacity_kw) if dc_capacity_kw else None,
                 'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
                 'daily_generation_target_kwh': float(daily_generation_target_kwh) if daily_generation_target_kwh else None,
