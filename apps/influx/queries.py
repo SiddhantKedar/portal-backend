@@ -15,7 +15,7 @@ INFLUX_ORG = os.getenv('INFLUX_ORG')
 # (Nov 2025). Update when CEA publishes a new edition.
 CO2_AVOIDED_FACTOR_KG_PER_KWH = 0.71
 
-MIN_POA_KWH_M2_FOR_PR = 0.5
+MIN_POA_KWH_M2_FOR_PR = 0.3
 
 # Determine when to show device is offline
 STALE_AFTER_SECONDS = 120
