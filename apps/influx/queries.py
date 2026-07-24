@@ -1552,11 +1552,15 @@ def get_inverter_detail_power_trend(bucket, site_id, device_id, date_str=None, i
 def get_inverter_daily_energy(bucket, site_id, device_id, days=7):
     """
     One inverter's own daily generation for the last N days.
-    Uses max() per day on energy_daily_kwh since it resets to 0 at midnight.
+    Derived as last - first of energy_total_kwh (lifetime counter) per IST day,
+    same pattern as the meter's get_daily_energy. Replaces the old energy_daily_kwh
+    max() approach, which is empty on inverters that don't populate that field.
+    The most recent day is partial (generation so far today).
     """
     client    = get_influx_client()
     query_api = client.query_api()
-    start     = get_n_days_ago_midnight_utc(days - 1)
+
+    start = get_n_days_ago_midnight_utc(days - 1)
     ist_offset = '5h30m'
 
     flux = f'''
@@ -1564,14 +1568,34 @@ def get_inverter_daily_energy(bucket, site_id, device_id, days=7):
 
         option location = timezone.fixed(offset: {ist_offset})
 
-        from(bucket: "{bucket}")
+        day_first = from(bucket: "{bucket}")
             |> range(start: {start})
             |> filter(fn: (r) => r._measurement == "solar_data")
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => r.device == "{device_id}")
-            |> filter(fn: (r) => r._field == "energy_daily_kwh")
+            |> filter(fn: (r) => r._field == "energy_total_kwh")
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-            |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")
+            |> aggregateWindow(every: 1d, fn: first, createEmpty: false, timeSrc: "_start")
+            |> map(fn: (r) => ({{r with _field: "v_first"}}))
+
+        day_last = from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) => r._field == "energy_total_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> aggregateWindow(every: 1d, fn: last, createEmpty: false, timeSrc: "_start")
+            |> map(fn: (r) => ({{r with _field: "v_last"}}))
+
+        union(tables: [day_first, day_last])
+            |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+            |> map(fn: (r) => ({{
+                _time  : r._time,
+                _value : r.v_last - r.v_first,
+                _field : "daily_generation_kwh"
+            }}))
+            |> keep(columns: ["_time", "_value", "_field"])
     '''
 
     try:
@@ -1586,7 +1610,7 @@ def get_inverter_daily_energy(bucket, site_id, device_id, days=7):
                 ist_time = record.get_time().astimezone(ist_tz)
                 results.append({
                     'date':       ist_time.strftime('%Y-%m-%d'),
-                    'energy_kwh': abs(round(record.get_value(), 2)),
+                    'energy_kwh': round(record.get_value(), 2),
                 })
 
         results.sort(key=lambda x: x['date'])
@@ -1594,8 +1618,7 @@ def get_inverter_daily_energy(bucket, site_id, device_id, days=7):
 
     except Exception as e:
         client.close()
-        raise Exception(f'Inverter daily energy query failed: {str(e)}')
-    
+        raise Exception(f'Inverter daily energy query failed: {str(e)}')    
 
 def get_all_inverters_pv_strings(bucket, site_id, inverter_ids):
     """
