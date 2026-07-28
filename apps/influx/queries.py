@@ -558,7 +558,7 @@ def _query_meter_live(query_api, bucket, site_id, meter_id):
     """
     flux = f'''
         from(bucket: "{bucket}")
-            |> range(start: -10m)
+            |> range(start: -6h)
             |> filter(fn: (r) => r._measurement == "solar_data")
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => r.device == "{meter_id}")
@@ -580,15 +580,24 @@ def _query_meter_live(query_api, bucket, site_id, meter_id):
     '''
 
     tables     = query_api.query(flux, org=INFLUX_ORG)
-    meter_data = {}
+    meter_data = {}      # fresh only — instantaneous fields
+    meter_last = {}      # last-known regardless of freshness — for cumulative counters
+    meter_time = None
 
     for table in tables:
         for record in table.records:
-            if not _is_fresh(record.get_time()):
-                continue
-            meter_data[record.get_field()] = record.get_value()
+            t     = record.get_time()
+            field = record.get_field()
+            value = record.get_value()
 
-    return meter_data
+            if meter_time is None or t > meter_time:
+                meter_time = t          # last-seen, regardless of freshness
+
+            meter_last[field] = value   # always keep last-known
+            if _is_fresh(t):
+                meter_data[field] = value  # fresh subset
+
+    return meter_data, meter_time, meter_last
 
 
 def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
@@ -879,7 +888,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
 
     try:
         # Four or five internal queries, one client session
-        meter_live      = _query_meter_live(query_api, bucket, site_id, meter_id)
+        meter_live, meter_time, meter_last = _query_meter_live(query_api, bucket, site_id, meter_id)
+        meter_is_live = bool(meter_live)
         energy_today    = _query_meter_today_energy(query_api, bucket, site_id, meter_id)
         inv_data, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
 
@@ -934,18 +944,21 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             active_power_kw = round(raw_active_power * -1, 2)
 
         performance_ratio_pct = None
-        if dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR and weather_fields:
+        if meter_is_live and dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR and weather_fields:
             performance_ratio_pct = round(
                 (energy_today / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
 
         cuf_pct = None
-        if ac_capacity_kw:
+        if meter_is_live and ac_capacity_kw:
             cuf_pct = round(
                 (energy_today / (float(ac_capacity_kw) * 24)) * 100, 2
             )
 
-        co2_avoided_today_kg = round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
+        co2_avoided_today_kg = (
+            round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
+            if meter_is_live else None
+        )
 
         
 
@@ -965,8 +978,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
                 'daily_generation_target_kwh': float(daily_generation_target_kwh) if daily_generation_target_kwh else None,
                 'energy_active_export_kwh': round(
-                    meter_live.get('energy_active_export_kwh', 0.0) + meter_energy_offset_kwh, 2
-                ) if meter_live else 0.0,
+                    meter_last['energy_active_export_kwh'] + meter_energy_offset_kwh, 2
+                ) if 'energy_active_export_kwh' in meter_last else 0.0,
             },
 
             'grid': {
@@ -984,6 +997,11 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'total':   total_inverters,
                 'online':  online_count,
                 'offline': total_inverters - online_count,
+            },
+
+            'meter': {
+                'status':       'online' if meter_is_live else 'offline',
+                'last_updated': meter_time.isoformat() if meter_time else None,
             },
 
             'weather': {
@@ -1018,7 +1036,7 @@ def _trend_stats(results, field):
     has in memory, so this costs nothing extra against the call budget.
     results must be time-sorted (both trend queries already sort by time).
     """
-    values = [point[field] for point in results]
+    values = [point[field] for point in results if point[field] is not None]
 
     if not values:
         return {'max': 0.0, 'mean': 0.0, 'last': 0.0}
@@ -1049,10 +1067,11 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
     query_api = client.query_api()
 
     try:
-        results = _query_plant_power_trend(
+        power_rows = _query_plant_power_trend(
             query_api, bucket, site_id, meter_id,
             start_str, end_str, interval_minutes
         )
+        power_map = {row['time']: row['active_power_total_kw'] for row in power_rows}
 
         irradiance_map = {}
         if weather_device_id:
@@ -1062,8 +1081,21 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
             )
 
         client.close()
-        for point in results:
-            point['irradiation_inclined_wm2'] = irradiance_map.get(point['time'], 0.0)
+
+        # Time axis is the UNION of both series, not just the meter. Otherwise a
+        # dead meter truncates the whole chart even while the weather station is
+        # live (and vice-versa). Buckets with no reading stay None so the frontend
+        # draws a gap instead of a fake zero.
+        all_times = sorted(set(power_map) | set(irradiance_map))
+        results = [
+            {
+                'time':                     t,
+                'active_power_total_kw':    power_map.get(t),
+                'irradiation_inclined_wm2': irradiance_map.get(t),
+            }
+            for t in all_times
+        ]
+
         return {
             'data':  results,
             'stats': {
@@ -1078,6 +1110,46 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
     
 
 # ── Inverter Overview Queries ──────────────────────────────────────────────────
+
+def _query_inverters_energy_integral(query_api, bucket, site_id, inverter_ids):
+    """
+    Internal (TEST): energy today per inverter via time-integral of
+    ac_active_power_kw since IST midnight (E = ∫P dt). Alternative to the counter
+    last-minus-first, for old inverters whose energy_total_kwh only ticks in
+    coarse 100 kWh steps. Grouped by device so N inverters cost one query.
+
+    Returns { device_id: energy_kwh_today }. Devices with no data are omitted
+    (caller should .get(id, 0.0)).
+    """
+    start = get_ist_midnight_utc()
+    device_filter = ' or '.join(
+        [f'r.device == "{d}"' for d in inverter_ids]
+    )
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "ac_active_power_kw")
+            |> filter(fn: (r) => exists r._value)
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> map(fn: (r) => ({{r with _value: if r._value < 0.0 then 0.0 else r._value}}))
+            |> group(columns: ["device", "_start", "_stop"])
+            |> integral(unit: 1h)
+    '''
+
+    result = {}
+    tables = query_api.query(flux, org=INFLUX_ORG)
+    for table in tables:
+        for record in table.records:
+            device = record.values.get('device')
+            value  = record.get_value()
+            if device is not None and value is not None:
+                result[device] = round(value, 3)
+
+    return result
 
 def _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids):
     """
@@ -1203,6 +1275,10 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             query_api, bucket, site_id, inverter_ids
         )
 
+        integral_energy_by_device = _query_inverters_energy_integral(
+            query_api, bucket, site_id, inverter_ids
+        )
+
         client.close()
 
         # Collect per device
@@ -1263,6 +1339,9 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 'device_id':               device_id,
                 'ac_active_power_kw':      active_power,
                 'energy_daily_kwh':        round(daily_gen, 3),
+                'energy_today_integral_kwh': round(
+                    integral_energy_by_device.get(device_id, 0.0), 3
+                ),
                 'energy_total_kwh':        abs(round(fields.get('energy_total_kwh', 0.0), 2)),
                 'ac_reactive_power_kvar':  abs(round(fields.get('ac_reactive_power_kvar', 0.0), 2)),
                 'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
@@ -1407,7 +1486,8 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
                 r._field == "internal_temp_c"         or
                 r._field == "grid_voltage_ab_v"       or
                 r._field == "grid_voltage_bc_v"       or
-                r._field == "grid_voltage_ca_v"
+                r._field == "grid_voltage_ca_v"       or
+                r._field == "dc_input_voltage_v"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -1471,6 +1551,7 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
             'grid_voltage_ab_v':       round(fields.get('grid_voltage_ab_v', 0.0), 1),
             'grid_voltage_bc_v':       round(fields.get('grid_voltage_bc_v', 0.0), 1),
             'grid_voltage_ca_v':       round(fields.get('grid_voltage_ca_v', 0.0), 1),
+            'dc_input_voltage_v':      round(fields.get('dc_input_voltage_v', 0.0), 2),
             'status':                  'online' if is_online else 'offline',
             'last_updated':            last_time.isoformat() if last_time else None,
         }
