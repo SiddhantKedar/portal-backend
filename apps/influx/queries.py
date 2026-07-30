@@ -709,7 +709,7 @@ def _query_irradiance_trend(query_api, bucket, site_id, device_id, start, end, i
 
 def _query_electrical_trend(query_api, bucket, site_id, meter_id, start, end, interval_minutes):
     """
-    Internal: fetches HT meter voltage/current/frequency trend for a whole
+    Internal: fetches meter1 voltage/current/frequency trend for a whole
     day, aggregated every interval_minutes.
     """
     flux = f'''
@@ -759,7 +759,7 @@ def _query_electrical_trend(query_api, bucket, site_id, meter_id, start, end, in
 
 def get_plant_electrical_trend(bucket, site_id, meter_id, date_str=None, interval_minutes=5):
     """
-    HT meter voltage/current/frequency trend for a selected date.
+    meter1 voltage/current/frequency trend for a selected date.
     Separate endpoint/graph from power+irradiance — min/max/last stats,
     not mean/max/last.
     """
@@ -950,17 +950,12 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             )
 
         cuf_pct = None
-        if meter_is_live and ac_capacity_kw:
+        if ac_capacity_kw:
             cuf_pct = round(
                 (energy_today / (float(ac_capacity_kw) * 24)) * 100, 2
             )
 
-        co2_avoided_today_kg = (
-            round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
-            if meter_is_live else None
-        )
-
-        
+        co2_avoided_today_kg = round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
 
         return {
             'last_updated': max(
@@ -1241,7 +1236,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
 
     flux = f'''
         from(bucket: "{bucket}")
-            |> range(start: -10m)
+            |> range(start: -6h)
             |> filter(fn: (r) => r._measurement == "solar_data")
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => {device_filter})
@@ -1281,19 +1276,29 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
 
         client.close()
 
-        # Collect per device
+        # Collect per device.
+        # device_data: fresh only — instantaneous fields, drives online/offline.
+        # device_last: last-known ungated — the cumulative energy_total_kwh counter,
+        # so Energy Total survives an outage instead of collapsing to 0 (same
+        # last-known pattern as the meter).
         device_data  = {}
+        device_last  = {}
         device_times = {}
 
         for table in tables:
             for record in table.records:
-                if not _is_fresh(record.get_time()):
-                    continue
-
                 device = record.values.get('device')
                 field  = record.get_field()
                 value  = record.get_value()
                 time   = record.get_time()
+
+                # last() yields one point per (device, field) over the 24h window
+                # — that's the last-known counter value; keep it regardless of age.
+                if field == 'energy_total_kwh':
+                    device_last.setdefault(device, {})[field] = value
+
+                if not _is_fresh(time):
+                    continue
 
                 if device not in device_data:
                     device_data[device] = {}
@@ -1317,6 +1322,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
 
         for device_id in inverter_ids:
             fields    = device_data.get(device_id, {})
+            last_fields = device_last.get(device_id, {})
             t         = device_times.get(device_id)
             is_online = bool(fields)
 
@@ -1342,7 +1348,10 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 'energy_today_integral_kwh': round(
                     integral_energy_by_device.get(device_id, 0.0), 3
                 ),
-                'energy_total_kwh':        abs(round(fields.get('energy_total_kwh', 0.0), 2)),
+                'energy_total_kwh':        (
+                    abs(round(last_fields['energy_total_kwh'], 2))
+                    if 'energy_total_kwh' in last_fields else 0.0
+                ),
                 'ac_reactive_power_kvar':  abs(round(fields.get('ac_reactive_power_kvar', 0.0), 2)),
                 'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
                 'grid_frequency_hz':       round(fields.get('grid_frequency_hz', 0.0), 2),
@@ -1472,7 +1481,7 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
 
     flux = f'''
         from(bucket: "{bucket}")
-            |> range(start: -10m)
+            |> range(start: -6h)
             |> filter(fn: (r) => r._measurement == "solar_data")
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => r.device == "{device_id}")
@@ -1513,16 +1522,25 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
 
         client.close()
 
-        fields    = {}
-        last_time = None
+        fields      = {}      # fresh only — instantaneous fields
+        last_fields = {}      # last-known ungated — cumulative counter
+        last_time   = None
 
         for table in tables:
             for record in table.records:
-                if not _is_fresh(record.get_time()):
+                field = record.get_field()
+                value = record.get_value()
+                t     = record.get_time()
+
+                # energy_total_kwh: keep last-known so Energy Total survives an
+                # outage instead of dropping to 0.
+                if field == 'energy_total_kwh':
+                    last_fields[field] = value
+
+                if not _is_fresh(t):
                     continue
 
-                fields[record.get_field()] = record.get_value()
-                t = record.get_time()
+                fields[field] = value
                 if last_time is None or t > last_time:
                     last_time = t
 
@@ -1540,7 +1558,10 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
             'device_id':               device_id,
             'ac_active_power_kw':      active_power,
             'energy_daily_kwh':        round(daily_gen, 3),
-            'energy_total_kwh':        abs(round(fields.get('energy_total_kwh', 0.0), 2)),
+            'energy_total_kwh':        (
+                abs(round(last_fields['energy_total_kwh'], 2))
+                if 'energy_total_kwh' in last_fields else 0.0
+            ),
             'ac_power_factor':         round(fields.get('ac_power_factor', 0.0), 2),
             'inverter_efficiency_pct': round(fields.get('inverter_efficiency_pct', 0.0), 1),
             'performance_ratio_pct':   performance_ratio_pct,
@@ -1799,7 +1820,7 @@ def get_meter_overview(bucket, sites_with_meters):
 
             flux = f'''
                 from(bucket: "{bucket}")
-                    |> range(start: -10m)
+                    |> range(start: -6h)
                     |> filter(fn: (r) => r._measurement == "solar_data")
                     |> filter(fn: (r) => r.site == "{site_id}")
                     |> filter(fn: (r) => {device_filter})
@@ -1827,18 +1848,24 @@ def get_meter_overview(bucket, sites_with_meters):
 
             tables       = query_api.query(flux, org=INFLUX_ORG)
             device_data  = {}
+            device_last  = {}
             device_times = {}
 
             for table in tables:
                 for record in table.records:
-
-                    if not _is_fresh(record.get_time()):
-                        continue
-
                     device = record.values.get('device')
                     field  = record.get_field()
                     value  = record.get_value()
                     time   = record.get_time()
+
+                    # energy_active_export_kwh (Total): keep last-known ungated so
+                    # it survives an outage instead of collapsing to 0. last() gives
+                    # one point per (device, field) over the 24h window.
+                    if field == 'energy_active_export_kwh':
+                        device_last.setdefault(device, {})[field] = value
+
+                    if not _is_fresh(time):
+                        continue
 
                     if device not in device_data:
                         device_data[device] = {}
@@ -1850,16 +1877,18 @@ def get_meter_overview(bucket, sites_with_meters):
             # Build result for each meter in this site group, in order
             for meter in meters:
                 influx_id = meter['influx_device_id']
-                fields    = device_data.get(influx_id, {})
+                fields      = device_data.get(influx_id, {})
+                last_fields = device_last.get(influx_id, {})
                 t         = device_times.get(influx_id)
                 is_online = bool(fields)
                 offset    = meter.get('energy_offset_kwh', 0.0)
 
-                raw_export_kwh = fields.get('energy_active_export_kwh', 0.0)
-                corrected_export_kwh = raw_export_kwh + offset if is_online else 0.0
+                # Total export comes from last-known so it persists through an
+                # outage. Offset only ever rides on an actual export reading.
+                export_last = last_fields.get('energy_active_export_kwh')
+                corrected_export_kwh = round(export_last + offset, 2) if export_last is not None else 0.0
 
                 energy_today  = _query_meter_today_energy(query_api, bucket, site_id, influx_id)
-
                 all_meters_result.append({
                     'device_pk':                   meter['pk'],
                     'device_id':                    influx_id,
@@ -1868,7 +1897,7 @@ def get_meter_overview(bucket, sites_with_meters):
                     'active_power_total_kw':         abs(round(fields.get('active_power_total_kw', 0.0), 2)),
                     'reactive_power_total_kvar':      round(fields.get('reactive_power_total_kvar', 0.0), 2),
                     'apparent_power_total_kva':       round(fields.get('apparent_power_total_kva', 0.0), 2),
-                    'energy_active_export_kwh':       round(corrected_export_kwh, 2),
+                    'energy_active_export_kwh':       corrected_export_kwh,
                     'energy_active_import_kwh':        round(fields.get('energy_active_import_kwh', 0.0), 2),
                     'energy_active_net_kwh':           round(fields.get('energy_active_net_kwh', 0.0), 2),
                     'energy_reactive_export_kvarh':    round(fields.get('energy_reactive_export_kvarh', 0.0), 2),

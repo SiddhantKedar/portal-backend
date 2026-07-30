@@ -127,10 +127,10 @@ class Command(BaseCommand):
         site_id = site.influx_site_id
 
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, name='HT Meter'
+            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
         ).first()
         if not meter:
-            raise Exception('No HT meter configured for this site')
+            raise Exception('No main meter configured for this site')
 
         inverters = list(Device.objects.filter(
             site=site, device_type='INVERTER', is_active=True
