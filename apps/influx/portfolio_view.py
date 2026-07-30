@@ -66,7 +66,7 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
 
         # 2 Postgres queries — all meters and inverters for these sites at once
         meters = Device.objects.filter(
-            site_id__in=site_pks, device_type='METER', is_active=True, name='HT Meter'
+            site_id__in=site_pks, device_type='METER', is_active=True, influx_device_id='meter1'
         )
         inverters = Device.objects.filter(
             site_id__in=site_pks, device_type='INVERTER', is_active=True

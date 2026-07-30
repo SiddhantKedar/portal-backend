@@ -45,11 +45,11 @@ class DailyEnergyView(TenantFilterMixin, APIView):
             )
 
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, name='HT Meter'
+            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
         ).first()
         if not meter:
             return Response(
-                {'detail': 'No HT meter found'},
+                {'detail': 'No main meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -110,11 +110,11 @@ class PlantOverviewView(TenantFilterMixin, APIView):
             )
 
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, name='HT Meter'
+            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
         ).first()
         if not meter:
             return Response(
-                {'detail': 'No HT meter found'},
+                {'detail': 'No main meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -200,11 +200,11 @@ class PlantPowerTrendView(TenantFilterMixin, APIView):
             )
 
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, name='HT Meter'
+            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
         ).first()
         if not meter:
             return Response(
-                {'detail': 'No HT meter found'},
+                {'detail': 'No main meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
         
@@ -241,7 +241,7 @@ class PlantPowerTrendView(TenantFilterMixin, APIView):
 class PlantElectricalTrendView(TenantFilterMixin, APIView):
     """
     GET /api/v1/plant/electrical-trend/?site=1&date=2026-06-03&interval=5
-    HT meter voltage/current/frequency trend for a selected date.
+    meter1 voltage/current/frequency trend for a selected date.
     """
     permission_classes = [IsAnyRole]
 
@@ -268,11 +268,11 @@ class PlantElectricalTrendView(TenantFilterMixin, APIView):
             )
 
         meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, name='HT Meter'
+            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
         ).first()
         if not meter:
             return Response(
-                {'detail': 'No active HT meter found'},
+                {'detail': 'No main meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
