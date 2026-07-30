@@ -60,7 +60,26 @@ def _is_fresh(record_time):
     age = (datetime.now(timezone.utc) - record_time).total_seconds()
     return age <= STALE_AFTER_SECONDS
 
+def _last_fresh_value(results, field):
+    """
+    The 'Now' value for a trend stat: the most recent non-null reading for
+    `field`, but ONLY if that reading is fresh (its timestamp within
+    STALE_AFTER_SECONDS of now). Returns None when the latest point is stale —
+    i.e. the device is offline, or the chart is a past date. Stops "Now" from
+    showing a value hours after the data actually stopped.
 
+    Walks newest-first, so it's O(1) whenever the series is live (common case).
+    `results` is time-sorted ascending; each point carries an ISO-8601 'time'
+    string (UTC, +00:00) from the trend query. max/min/mean stay ungated —
+    those describe the day and remain true while the device is offline.
+    """
+    for point in reversed(results):
+        val = point.get(field)
+        if val is None:
+            continue
+        point_time = datetime.fromisoformat(point['time'])
+        return round(val, 2) if _is_fresh(point_time) else None
+    return None
 # ── Overview Queries ───────────────────────────────────────────────────────────
 
 def _query_inverter_snapshot(query_api, bucket, site_id, inverter_ids):
@@ -808,7 +827,7 @@ def _trend_stats_minmax(results, field):
     return {
         'min':  round(min(values), 2),
         'max':  round(max(values), 2),
-        'last': round(values[-1], 2),
+        'last': _last_fresh_value(results, field),
     }
 
 
@@ -1039,7 +1058,7 @@ def _trend_stats(results, field):
     return {
         'max':  round(max(values), 2),
         'mean': round(sum(values) / len(values), 2),
-        'last': round(values[-1], 2),
+        'last': _last_fresh_value(results, field),
     }
 
 
