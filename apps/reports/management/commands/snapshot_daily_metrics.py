@@ -11,11 +11,11 @@
 # Idempotent — safe to re-run any date any number of times (update_or_create
 # on the site+date unique constraint). One site failing never stops the rest.
 
+import sys
 from datetime import datetime, timedelta, timezone as dt_timezone
 from decimal import Decimal
 
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
 
 from apps.sites.models import Site, Device
 from apps.reports.models import DailySiteSnapshot
@@ -29,6 +29,7 @@ from apps.influx.queries import (
     _query_poa_irradiation_for_day,
     _query_meter_peak_power_for_day,
     _query_inverter_daily_sum_for_day,
+    _query_generation_window_for_day,
 )
 
 def _dec(value):
@@ -38,6 +39,13 @@ def _dec(value):
     """
     return None if value is None else Decimal(str(value))
 
+
+class SkipSite(Exception):
+    """Site legitimately can't be snapshotted (e.g. no main meter configured).
+    Non-fatal — counted as skipped, never trips the job's exit code."""
+    pass
+
+
 class Command(BaseCommand):
     help = 'Computes and stores DailySiteSnapshot rows for GENERATION sites.'
 
@@ -45,9 +53,8 @@ class Command(BaseCommand):
         parser.add_argument('--site', type=int, default=None,
                              help='Postgres Site pk. Omit to run all active GENERATION sites.')
         parser.add_argument('--date', type=str, default=None,
-                         help='YYYY-MM-DD. Defaults to today (IST) — job is scheduled '
-                              '~11:50pm IST so "today" already covers the full '
-                              'generation day. Ignored if --start/--end given.')
+                         help='YYYY-MM-DD. Defaults to yesterday (IST) — the last '
+                              'completed generation day. Ignored if --start/--end given.')
         parser.add_argument('--start', type=str, default=None,
                              help='YYYY-MM-DD, used with --end for a date range backfill.')
         parser.add_argument('--end', type=str, default=None,
@@ -69,7 +76,7 @@ class Command(BaseCommand):
                 raise CommandError('--date cannot be combined with --start/--end.')
             dates = self._date_range(start_str, end_str)
         else:
-            dates = [self._validate_date(date_str) if date_str else self._ist_today_str()]
+            dates = [self._validate_date(date_str) if date_str else self._ist_yesterday_str()]
 
         sites_qs = Site.objects.filter(
             site_type=Site.SiteType.GENERATION, is_active=True
@@ -84,22 +91,31 @@ class Command(BaseCommand):
         self.stdout.write(f'Processing {len(sites)} site(s) across {len(dates)} date(s)...')
 
         success_count = 0
-        fail_count = 0
+        skip_count    = 0
+        fail_count    = 0
 
         for d in dates:
             for site in sites:
                 try:
                     self._snapshot_one(site, d)
                     success_count += 1
+                except SkipSite as e:
+                    skip_count += 1
+                    self.stdout.write(self.style.WARNING(
+                        f'[{site.pk}] {site.name} — {d}: SKIPPED — {e}'
+                    ))
                 except Exception as e:
                     fail_count += 1
                     self.stderr.write(self.style.ERROR(
                         f'[{site.pk}] {site.name} — {d}: FAILED — {e}'
                     ))
 
-        self.stdout.write(self.style.SUCCESS(
-            f'Done. {success_count} succeeded, {fail_count} failed.'
-        ))
+        summary = (f'Done. {success_count} succeeded, '
+                   f'{skip_count} skipped, {fail_count} failed.')
+        if fail_count:
+            self.stderr.write(self.style.ERROR(summary))
+            sys.exit(1)
+        self.stdout.write(self.style.SUCCESS(summary))
 
     def _validate_date(self, date_str):
         try:
@@ -118,9 +134,9 @@ class Command(BaseCommand):
         days = (end - start).days
         return [(start + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(days + 1)]
 
-    def _ist_today_str(self):
+    def _ist_yesterday_str(self):
         ist = dt_timezone(timedelta(hours=5, minutes=30))
-        return datetime.now(ist).date().strftime('%Y-%m-%d')
+        return (datetime.now(ist).date() - timedelta(days=1)).strftime('%Y-%m-%d')
 
     def _snapshot_one(self, site, date_str):
         bucket  = site.customer.influx_bucket
@@ -130,7 +146,7 @@ class Command(BaseCommand):
             site=site, device_type='METER', is_active=True, influx_device_id='meter1'
         ).first()
         if not meter:
-            raise Exception('No main meter configured for this site')
+            raise SkipSite('No main meter configured for this site')
 
         inverters = list(Device.objects.filter(
             site=site, device_type='INVERTER', is_active=True
@@ -165,6 +181,10 @@ class Command(BaseCommand):
                 poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
 
             peak_power_kw, peak_power_time = _query_meter_peak_power_for_day(
+                query_api, bucket, site_id, meter.influx_device_id, start, end
+            )
+
+            gen_start_time, gen_end_time = _query_generation_window_for_day(
                 query_api, bucket, site_id, meter.influx_device_id, start, end
             )
         finally:
@@ -210,6 +230,8 @@ class Command(BaseCommand):
                 'co2_avoided_kg': _dec(co2_avoided_kg),
                 'peak_power_kw': _dec(peak_power_kw),
                 'peak_power_time': peak_power_time,
+                'generation_start_time': gen_start_time,
+                'generation_end_time':   gen_end_time,
                 'meter_status': meter_status,
                 'inverters_online_count': inv_reporting_count,
                 'inverters_total_count': len(inverter_ids),
@@ -219,5 +241,6 @@ class Command(BaseCommand):
         verb = 'Created' if created else 'Updated'
         self.stdout.write(
             f'[{site.pk}] {site.name} — {date_str}: {verb} '
-            f'(energy={energy_kwh} kWh, meter_status={meter_status})'
+            f'(energy={energy_kwh} kWh, meter_status={meter_status}, '
+            f'gen={gen_start_time} → {gen_end_time})'
         )

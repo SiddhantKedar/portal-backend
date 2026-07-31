@@ -21,6 +21,9 @@ class DailySiteSnapshot(models.Model):
     peak_power_kw = models.DecimalField(max_digits=8, decimal_places=2, null=True)
     peak_power_time = models.DateTimeField(null=True)
 
+    generation_start_time = models.DateTimeField(null=True)
+    generation_end_time = models.DateTimeField(null=True)
+
     meter_status = models.CharField(
         max_length=10,
         choices=[('ok', 'OK'), ('no_data', 'No Data')],
