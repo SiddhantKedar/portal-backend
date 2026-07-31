@@ -23,6 +23,9 @@ STALE_AFTER_SECONDS = 120
 # For Generation start stop
 GENERATION_STOP_GAP_SECONDS = 120
 
+# Minimum active power to consider generating
+EXPORT_THRESHOLD_KW = -1.0
+
 
 # ── Timezone Helper ────────────────────────────────────────────────────────────
 
@@ -2516,16 +2519,26 @@ def _query_plant_generation_window(query_api, bucket, site_id, meter_id):
           start/end reflect whatever was seen before it went dark
     """
     start = get_ist_midnight_utc()
-    EXPORT_THRESHOLD_KW = -1.0
 
+    # Push the reduction into Influx: instead of transferring every raw point
+    # since midnight (thousands by evening) and looping in Python every 60s, ask
+    # for just the three timestamps we use. first()/last() run server-side; ~3
+    # rows come back regardless of how long the day has been.
     flux = f'''
-        from(bucket: "{bucket}")
+        base = from(bucket: "{bucket}")
             |> range(start: {start})
             |> filter(fn: (r) => r._measurement == "solar_data")
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => r.device == "{meter_id}")
             |> filter(fn: (r) => r._field == "active_power_total_kw")
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+
+        exporting = base
+            |> filter(fn: (r) => r._value <= {EXPORT_THRESHOLD_KW})
+
+        exporting |> first() |> yield(name: "first_export")
+        exporting |> last()  |> yield(name: "last_export")
+        base      |> last()  |> yield(name: "latest_point")
     '''
 
     tables = query_api.query(flux, org=INFLUX_ORG)
@@ -2536,17 +2549,14 @@ def _query_plant_generation_window(query_api, bucket, site_id, meter_id):
 
     for table in tables:
         for record in table.records:
-            t = record.get_time()
-            v = record.get_value()
-
-            if latest_point_time is None or t > latest_point_time:
+            result = record.values.get('result')
+            t      = record.get_time()
+            if result == 'first_export':
+                first_export_time = t
+            elif result == 'last_export':
+                last_export_time = t
+            elif result == 'latest_point':
                 latest_point_time = t
-
-            if v is not None and v <= EXPORT_THRESHOLD_KW:
-                if first_export_time is None or t < first_export_time:
-                    first_export_time = t
-                if last_export_time is None or t > last_export_time:
-                    last_export_time = t
 
     now = datetime.now(timezone.utc)
 
@@ -2580,3 +2590,47 @@ def _query_plant_generation_window(query_api, bucket, site_id, meter_id):
             'start_time': first_export_time.isoformat(),
             'end_time':   last_export_time.isoformat(),
         }
+
+
+def _query_generation_window_for_day(query_api, bucket, site_id, meter_id, start, end):
+    """
+    Internal: first/last export timestamps over a *completed* IST day, for the
+    daily snapshot. Snapshot twin of _query_plant_generation_window with the
+    live-only machinery removed: a finished day has no now(), no freshness gate,
+    and no operational/stopped/no_data state — that day-level health already
+    lives in meter_status. So we return just the two boundary timestamps.
+
+    first()/last() run server-side on the exporting-only stream, so only two
+    rows come back regardless of how long the day was.
+
+    Returns (start_time, end_time) as tz-aware UTC datetimes, or (None, None)
+    if the meter never crossed the export threshold that day (washout / dark).
+    """
+    flux = f'''
+        exporting = from(bucket: "{bucket}")
+            |> range(start: {start}, stop: {end})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{meter_id}")
+            |> filter(fn: (r) => r._field == "active_power_total_kw")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> filter(fn: (r) => r._value <= {EXPORT_THRESHOLD_KW})
+
+        exporting |> first() |> yield(name: "first_export")
+        exporting |> last()  |> yield(name: "last_export")
+    '''
+
+    tables = query_api.query(flux, org=INFLUX_ORG)
+
+    start_time = None
+    end_time   = None
+
+    for table in tables:
+        for record in table.records:
+            result = record.values.get('result')
+            if result == 'first_export':
+                start_time = record.get_time()
+            elif result == 'last_export':
+                end_time = record.get_time()
+
+    return start_time, end_time
