@@ -16,6 +16,8 @@ class UserSerializer(serializers.ModelSerializer):
     installers     = serializers.SerializerMethodField()
     customer_id    = serializers.SerializerMethodField()
     customer_name  = serializers.SerializerMethodField()
+    site_id     = serializers.SerializerMethodField()
+    site_name   = serializers.SerializerMethodField()
 
     class Meta:
         model  = User
@@ -31,6 +33,8 @@ class UserSerializer(serializers.ModelSerializer):
             'installers',
             'customer_id',
             'customer_name',
+            'site_id',
+            'site_name',
             'is_active',
         )
         read_only_fields = fields   # this endpoint is read only, no editing here
@@ -66,11 +70,25 @@ class UserSerializer(serializers.ModelSerializer):
     def get_customer_id(self, obj):
         if obj.customer:
             return obj.customer.id
+        if obj.role == User.Role.SITE_USER and obj.site:
+            return obj.site.customer_id
         return None
 
     def get_customer_name(self, obj):
         if obj.customer:
             return obj.customer.name
+        if obj.role == User.Role.SITE_USER and obj.site:
+            return obj.site.customer.name
+        return None
+
+    def get_site_id(self, obj):
+        if obj.role == User.Role.SITE_USER and obj.site:
+            return obj.site.id
+        return None
+
+    def get_site_name(self, obj):
+        if obj.role == User.Role.SITE_USER and obj.site:
+            return obj.site.name
         return None
 
 

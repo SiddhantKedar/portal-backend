@@ -25,9 +25,10 @@ class UserManager(BaseUserManager):
 class User(AbstractBaseUser, PermissionsMixin):
 
     class Role(models.TextChoices):
-        ADMIN    = 'ADMIN',    'Admin'
+        ADMIN     = 'ADMIN',     'Admin'
         INSTALLER = 'INSTALLER', 'Installer'
-        CUSTOMER = 'CUSTOMER', 'Customer'
+        CUSTOMER  = 'CUSTOMER',  'Customer'
+        SITE_USER = 'SITE_USER', 'Site User'
 
     # Core fields
     email      = models.EmailField(unique=True)
@@ -48,6 +49,15 @@ class User(AbstractBaseUser, PermissionsMixin):
     # Link to customer — set if role is CUSTOMER
     customer = models.ForeignKey(
         'sites.Customer',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='users'
+    )
+
+    # Linke to a single site - set ONLY if role is SITE_USER
+    site = models.ForeignKey(
+        'sites.Site',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -88,22 +98,31 @@ class User(AbstractBaseUser, PermissionsMixin):
     @property
     def is_customer(self):
         return self.role == self.Role.CUSTOMER
+
+    @property
+    def is_site_user(self):
+        return self.role == self.Role.SITE_USER
     
     def clean(self):
         super().clean()
         if self.role == self.Role.ADMIN:
-            if self.installer_id or self.customer_id:
-                raise ValidationError('Admin users must not have an installer or customer assigned.')
+            if self.installer_id or self.customer_id or self.site_id:
+                raise ValidationError('Admin users must not have an installer, customer, or site assigned.')
         elif self.role == self.Role.INSTALLER:
             if not self.installer_id:
                 raise ValidationError('Installer users must have an installer assigned.')
-            if self.customer_id:
-                raise ValidationError('Installer users must not have a customer assigned.')
+            if self.customer_id or self.site_id:
+                raise ValidationError('Installer users must not have a customer or site assigned.')
         elif self.role == self.Role.CUSTOMER:
             if not self.customer_id:
                 raise ValidationError('Customer users must have a customer assigned.')
-            if self.installer_id:
-                raise ValidationError('Customer users must not have an installer assigned.')
+            if self.installer_id or self.site_id:
+                raise ValidationError('Customer users must not have an installer or site assigned.')
+        elif self.role == self.Role.SITE_USER:
+            if not self.site_id:
+                raise ValidationError('Site users must have a site assigned.')
+            if self.installer_id or self.customer_id:
+                raise ValidationError('Site users must not have an installer or customer assigned.')
 
     def save(self, *args, **kwargs):
         self.clean()
