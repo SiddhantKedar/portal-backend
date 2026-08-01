@@ -43,6 +43,18 @@ class IsCustomerUser(BasePermission):
         )
 
 
+class IsSiteUser(BasePermission):
+    """
+    Only allows access to users with SITE_USER role.
+    eg: an operator scoped to a single site and its substation.
+    """
+    def has_permission(self, request, view):
+        return (
+            request.user.is_authenticated and
+            request.user.role == 'SITE_USER'
+        )
+
+
 class IsAdminOrInstaller(BasePermission):
     """
     Allows access to both ADMIN and INSTALLER roles.
@@ -67,5 +79,5 @@ class IsAnyRole(BasePermission):
     def has_permission(self, request, view):
         return (
             request.user.is_authenticated and
-            request.user.role in ('ADMIN', 'INSTALLER', 'CUSTOMER')
+            request.user.role in ('ADMIN', 'INSTALLER', 'CUSTOMER',  'SITE_USER')
         )
