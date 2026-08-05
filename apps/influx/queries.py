@@ -2455,44 +2455,60 @@ def _query_meter_peak_power_for_day(query_api, bucket, site_id, meter_id, start,
 
 def _query_inverter_daily_sum_for_day(query_api, bucket, site_id, inverter_ids, start, end):
     """
-    Internal: sum of each inverter's own energy_daily_kwh for the given IST day.
+    Internal: summed inverter generation for the given IST day, derived as
+    last - first of each inverter's energy_total_kwh (lifetime counter), then
+    summed. Matches the meter's daily-energy derivation and the live
+    get_inverter_daily_energy. energy_daily_kwh is retired (self-resetting,
+    absent on newer sites — reading it gave 0/N online + 0 sum).
 
-    NOTE: uses max(), not last(). energy_daily_kwh is an accumulator that rises
-    through the generation day and then drops to 0 when the inverter shuts down
-    at sunset (and/or resets at its internal midnight). last() therefore reads a
-    sleeping inverter and returns 0.0. The day's total is the peak the counter
-    reached, not its value at 23:59.
+    Server-side first()/last() per device group — same weight class as the
+    meter's single-day query, not the raw series.
 
-    Cross-check figure only — not the authoritative daily energy (that's the
-    meter). Expect this to run slightly ABOVE meter export, since it's measured
-    at the inverter AC terminals, before transformer/cable losses.
+    "Reporting" = the inverter communicated energy_total_kwh at all that day
+    (has both a first and last point). A real 0 kWh washout still counts as
+    online; only a silent inverter is 0/N. Cross-check figure vs the meter,
+    not the authoritative daily energy.
 
     Returns (total_kwh, count_reporting).
     """
     device_filter = ' or '.join(f'r.device == "{d}"' for d in inverter_ids)
 
     flux = f'''
-        from(bucket: "{bucket}")
+        base = from(bucket: "{bucket}")
             |> range(start: {start}, stop: {end})
             |> filter(fn: (r) => r._measurement == "solar_data")
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => {device_filter})
-            |> filter(fn: (r) => r._field == "energy_daily_kwh")
+            |> filter(fn: (r) => r._field == "energy_total_kwh")
+            |> filter(fn: (r) => exists r._value)
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-            |> max()
+
+        base |> first() |> yield(name: "first")
+        base |> last()  |> yield(name: "last")
     '''
 
     tables = query_api.query(flux, org=INFLUX_ORG)
-    total = 0.0
-    count = 0
 
+    firsts = {}
+    lasts  = {}
     for table in tables:
         for record in table.records:
-            value = record.get_value()
-            if value is None:
+            result = record.values.get('result')   # 'first' / 'last' (yield name)
+            device = record.values.get('device')
+            value  = record.get_value()
+            if value is None or device is None:
                 continue
-            total += abs(value)
-            count += 1
+            if result == 'first':
+                firsts[device] = value
+            elif result == 'last':
+                lasts[device] = value
+
+    total = 0.0
+    count = 0
+    for device in inverter_ids:
+        if device in firsts and device in lasts:
+            count += 1                                        # communicated → online
+            total += max(0.0, lasts[device] - firsts[device])  # a day can't generate negative
 
     return round(total, 3), count
 
