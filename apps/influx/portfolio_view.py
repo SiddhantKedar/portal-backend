@@ -143,6 +143,8 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                     'installer_name':   site.installer.name if site.installer_id else None,
                     'active_power_kw':  active_power,
                     'energy_today_kwh': energy_today,
+                    'dc_capacity_kw':   float(site.dc_capacity_kw) if site.dc_capacity_kw is not None else None,
+                    'ac_capacity_kw':   float(site.ac_capacity_kw) if site.ac_capacity_kw is not None else None,
                     'meter_online':     meter_online,
                     'inverters_online': inv_online,
                     'inverters_total':  inv_total,
