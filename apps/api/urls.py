@@ -8,4 +8,5 @@ urlpatterns = [
     path('auth/', include('apps.users.urls')),
     path('', include('apps.sites.urls')),
     path('influx/', include('apps.influx.urls')),
+    path('reports/', include('apps.reports.urls')),
 ]
