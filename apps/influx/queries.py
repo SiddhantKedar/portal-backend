@@ -624,8 +624,15 @@ def _query_meter_live(query_api, bucket, site_id, meter_id):
 
 def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
     """
-    Internal: fetches per-inverter ac_active_power_kw and energy_daily_kwh.
-    Also determines online/offline status.
+    Internal: per-inverter live snapshot for the plant overview.
+      device_data  — fresh only (ac_active_power_kw, dc_input_power_kw); drives
+                     online/offline and the instantaneous values.
+      device_last  — last-known energy_total_kwh, UNGATED, so the lifetime
+                     counter persists while the inverter is offline (same
+                     fresh/last-known split as get_inverter_overview).
+    Window is -6h (not -10m) so an offline inverter's last counter is still in
+    range for the ungated capture; the 120s freshness gate still protects the
+    instantaneous fields regardless of window.
     """
     device_filter = ' or '.join(
         [f'r.device == "{d}"' for d in inverter_ids]
@@ -633,14 +640,14 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
 
     flux = f'''
         from(bucket: "{bucket}")
-            |> range(start: -10m)
+            |> range(start: -6h)
             |> filter(fn: (r) => r._measurement == "solar_data")
             |> filter(fn: (r) => r.site == "{site_id}")
             |> filter(fn: (r) => {device_filter})
             |> filter(fn: (r) =>
                 r._field == "ac_active_power_kw" or
-                r._field == "energy_daily_kwh" or
-                r._field == "dc_input_power_kw"
+                r._field == "dc_input_power_kw" or
+                r._field == "energy_total_kwh"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -648,18 +655,23 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
 
     tables       = query_api.query(flux, org=INFLUX_ORG)
     device_data  = {}
+    device_last  = {}
     device_times = {}
 
     for table in tables:
         for record in table.records:
             device = record.values.get('device')
+            field  = record.get_field()
+            value  = record.get_value()
             time   = record.get_time()
 
+            # Lifetime counter: keep last-known regardless of age (persists offline).
+            if field == 'energy_total_kwh':
+                device_last.setdefault(device, {})[field] = value
+
+            # Instantaneous fields: fresh only.
             if not _is_fresh(time):
                 continue
-
-            field = record.get_field()
-            value = record.get_value()
 
             if device not in device_data:
                 device_data[device] = {}
@@ -668,7 +680,7 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
             if device not in device_times or time > device_times[device]:
                 device_times[device] = time
 
-    return device_data, device_times
+    return device_data, device_last, device_times
 
 
 def _query_plant_power_trend(query_api, bucket, site_id, meter_id, start, end, interval_minutes):
@@ -913,7 +925,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         meter_live, meter_time, meter_last = _query_meter_live(query_api, bucket, site_id, meter_id)
         meter_is_live = bool(meter_live)
         energy_today    = _query_meter_today_energy(query_api, bucket, site_id, meter_id)
-        inv_data, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
+        inv_data, inv_last, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
+        inv_today_by_device = _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids)
 
         weather_fields = {}
         weather_time   = None
@@ -938,18 +951,25 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         total_dc_power = 0.0
 
         for device_id in inverter_ids:
-            fields = inv_data.get(device_id, {})
-            t      = inv_times.get(device_id)
+            fields    = inv_data.get(device_id, {})
+            last_flds = inv_last.get(device_id, {})
+            t         = inv_times.get(device_id)
             is_online = bool(fields)
 
             if is_online:
                 online_count += 1
                 total_dc_power += fields.get('dc_input_power_kw', 0.0)
 
+            # e_today: calculated last−first (not the retired energy_daily_kwh).
+            # e_total: last-known lifetime, ungated → persists while offline.
+            daily_gen = abs(inv_today_by_device.get(device_id, 0.0))
+            total_gen = abs(last_flds.get('energy_total_kwh', 0.0))
+
             inverter_list.append({
                 'device_id':       device_id,
                 'active_power_kw': round(fields.get('ac_active_power_kw', 0.0), 2),
-                'daily_gen_kwh':   round(fields.get('energy_daily_kwh', 0.0), 3),
+                'daily_gen_kwh':   round(daily_gen, 3),
+                'total_gen_kwh':   round(total_gen, 2),
                 'status':          'online' if is_online else 'offline',
                 'last_updated':    t.isoformat() if t else None,
             })

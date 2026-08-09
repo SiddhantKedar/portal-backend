@@ -11,6 +11,8 @@ from .analytics_views import AnalyticsMetricsListView, AnalyticsView
 from .portfolio_view import PortfolioOverviewView
 from .weather_views import WeatherSnapshotView
 
+from .temp_inverter_status_views import TempInverterStatusView
+
 urlpatterns = [
     path('dashboard/daily-energy/', DailyEnergyView.as_view(),        name='daily-energy'),
      # Plant overview page
@@ -46,4 +48,8 @@ urlpatterns = [
 
     # Weather station Page
     path('weather/', WeatherSnapshotView.as_view()),
+
+    # TEMP — admin inverter_status monitor. Delete this line + the temp file
+    # once the inverter_status field is confirmed working.
+    path('admin/inverter-status/', TempInverterStatusView.as_view()),
 ]
