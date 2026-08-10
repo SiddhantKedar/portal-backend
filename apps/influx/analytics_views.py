@@ -42,7 +42,7 @@ class AnalyticsView(TenantFilterMixin, APIView):
         metrics_str = request.query_params.get('metrics')
         device_ids  = request.query_params.get('devices')
         date_str    = request.query_params.get('date', None)
-        interval    = int(request.query_params.get('interval', 5))
+        interval    = int(request.query_params.get('interval', 1))
 
         if not site_id or not metrics_str or not device_ids:
             return Response(
@@ -50,8 +50,8 @@ class AnalyticsView(TenantFilterMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if interval < 5:
-            interval = 5
+        if interval < 1:
+            interval = 1
 
         metric_keys = [m for m in metrics_str.split(',') if m]
         metrics     = {}
@@ -87,7 +87,15 @@ class AnalyticsView(TenantFilterMixin, APIView):
                 if not field:
                     continue
                 series_key = f'{device.influx_device_id}__{metric_key}'
-                series_map[series_key] = {'device': device.influx_device_id, 'field': field}
+                series_map[series_key] = {
+                    'device': device.influx_device_id,
+                    'field':  field,
+                    # Meter stores active power with export negative. Flip only
+                    # meter active power so outgoing reads positive (and import
+                    # reads negative — you wanted to see both). Inverters and all
+                    # other meter fields are left as-is.
+                    'negate': device.device_type == 'METER' and field == 'active_power_total_kw',
+                }
                 legend.append({
                     'key':         series_key,
                     'device_id':   device.pk,

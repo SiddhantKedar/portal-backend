@@ -127,20 +127,27 @@ class InverterPowerTrendView(TenantFilterMixin, APIView):
         inverter_ids = list(name_map.keys())
         bucket       = site.customer.influx_bucket
 
+        weather_device = Device.objects.filter(
+            site=site, device_type='WEATHER_STATION', is_active=True
+        ).first()
+        weather_device_id = weather_device.influx_device_id if weather_device else None
+
         try:
             data = get_inverter_power_trend(
-                bucket           = bucket,
-                site_id          = site.influx_site_id,
-                inverter_ids     = inverter_ids,
-                date_str         = date_str,
-                interval_minutes = interval,
+                bucket            = bucket,
+                site_id           = site.influx_site_id,
+                inverter_ids      = inverter_ids,
+                weather_device_id = weather_device_id,
+                date_str          = date_str,
+                interval_minutes  = interval,
             )
 
             return Response({
                 'site':     site.name,
                 'date':     date_str or 'today',
                 'interval': interval,
-                'data':     data,
+                'data':     data['data'],
+                'stats':    data['stats'],
             })
 
         except Exception as e:

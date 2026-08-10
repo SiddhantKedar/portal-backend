@@ -1426,11 +1426,16 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
         raise Exception(f'Inverter overview query failed: {str(e)}')
     
 
-def get_inverter_power_trend(bucket, site_id, inverter_ids, date_str=None, interval_minutes=5):
+def get_inverter_power_trend(bucket, site_id, inverter_ids, weather_device_id=None, date_str=None, interval_minutes=5):
     """
-    Inverter power trend for a selected date.
-    Sums ac_active_power_kw across all inverters per time bucket.
+    Inverter power trend for a selected date. Sums ac_active_power_kw across all
+    inverters per bucket and overlays weather-station irradiance — same dual-series
+    shape, keys and stats as get_plant_power_trend.
     date_str: 'YYYY-MM-DD' in IST. Defaults to today if not provided.
+
+    weather_device_id optional — None skips the irradiance query. Time axis is the
+    UNION of both series, so an offline station never truncates the power trace
+    (and vice-versa); absent buckets stay None for the frontend to gap.
     """
     ist = timezone(timedelta(hours=5, minutes=30))
 
@@ -1445,22 +1450,20 @@ def get_inverter_power_trend(bucket, site_id, inverter_ids, date_str=None, inter
             hour=0, minute=0, second=0, microsecond=0
         )
 
-    # Start = IST midnight → UTC
-    start_ist    = requested_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_utc    = start_ist.astimezone(timezone.utc)
+    start_ist = requested_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_ist.astimezone(timezone.utc)
 
-    # End = now if today, else next midnight
-    now_ist      = datetime.now(ist)
-    today_ist    = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    now_ist   = datetime.now(ist)
+    today_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
 
     if start_ist.date() == today_ist.date():
-        end_utc  = datetime.now(timezone.utc)
+        end_utc = datetime.now(timezone.utc)
     else:
-        end_ist  = start_ist + timedelta(days=1)
-        end_utc  = end_ist.astimezone(timezone.utc)
+        end_ist = start_ist + timedelta(days=1)
+        end_utc = end_ist.astimezone(timezone.utc)
 
-    start_str    = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-    end_str      = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
     device_filter = ' or '.join(
         [f'r.device == "{d}"' for d in inverter_ids]
@@ -1482,23 +1485,45 @@ def get_inverter_power_trend(bucket, site_id, inverter_ids, date_str=None, inter
     '''
 
     try:
-        tables  = query_api.query(flux, org=INFLUX_ORG)
-        client.close()
+        tables = query_api.query(flux, org=INFLUX_ORG)
 
-        results = []
+        power_map = {}
         for table in tables:
             for record in table.records:
                 total = sum(
                     abs(record.values.get(d) or 0.0)
                     for d in inverter_ids
                 )
-                results.append({
-                    'time':     record.get_time().isoformat(),
-                    'power_kw': round(total, 2),
-                })
+                power_map[record.get_time().isoformat()] = round(total, 2)
 
-        results.sort(key=lambda x: x['time'])
-        return results
+        # Irradiance query MUST run before client.close() (closed-client queries
+        # return silent empties).
+        irradiance_map = {}
+        if weather_device_id:
+            irradiance_map = _query_irradiance_trend(
+                query_api, bucket, site_id, weather_device_id,
+                start_str, end_str, interval_minutes
+            )
+
+        client.close()
+
+        all_times = sorted(set(power_map) | set(irradiance_map))
+        results = [
+            {
+                'time':                     t,
+                'active_power_total_kw':    power_map.get(t),
+                'irradiation_inclined_wm2': irradiance_map.get(t),
+            }
+            for t in all_times
+        ]
+
+        return {
+            'data':  results,
+            'stats': {
+                'active_power_total_kw':    _trend_stats(results, 'active_power_total_kw'),
+                'irradiation_inclined_wm2': _trend_stats(results, 'irradiation_inclined_wm2'),
+            },
+        }
 
     except Exception as e:
         client.close()
@@ -2043,10 +2068,14 @@ def get_analytics_data(bucket, site_id, series_map, date_str=None, interval_minu
                 if not key:
                     continue
 
+                value = record.get_value()
+                if series_map[key].get('negate'):
+                    value = -value   # meter active power: export → positive, import → negative
+
                 time_iso = record.get_time().isoformat()
                 if time_iso not in points_by_time:
                     points_by_time[time_iso] = {'time': time_iso}
-                points_by_time[time_iso][key] = round(record.get_value(), 3)
+                points_by_time[time_iso][key] = round(value, 3)
 
         results = sorted(points_by_time.values(), key=lambda p: p['time'])
         return results
