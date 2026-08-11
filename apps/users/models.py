@@ -35,9 +35,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     first_name = models.CharField(max_length=150)
     last_name  = models.CharField(max_length=150)
     whatsapp_number = models.CharField(
-        max_length=20, null=True, blank=True,
-        help_text="E.164 format incl. country code, e.g. +91(number). "
-                "Null = no WhatsApp delivery (opt-out)."
+        max_length=15, null=True, blank=True,
+        help_text="WhatsApp number with country code, no '+', e.g. 918424882274. "
+                "Null = no WhatsApp delivery.",
     )
     role       = models.CharField(max_length=20, choices=Role.choices)
 
