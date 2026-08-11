@@ -34,6 +34,11 @@ class User(AbstractBaseUser, PermissionsMixin):
     email      = models.EmailField(unique=True)
     first_name = models.CharField(max_length=150)
     last_name  = models.CharField(max_length=150)
+    whatsapp_number = models.CharField(
+        max_length=20, null=True, blank=True,
+        help_text="E.164 format incl. country code, e.g. +91(number). "
+                "Null = no WhatsApp delivery (opt-out)."
+    )
     role       = models.CharField(max_length=20, choices=Role.choices)
 
     # Link to installer company — only set if role is INSTALLER or CUSTOMER
