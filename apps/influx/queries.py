@@ -1961,7 +1961,7 @@ def get_meter_overview(bucket, sites_with_meters):
                     'device_id':                    influx_id,
                     'name':                          meter['name'],
                     'site_type':                    site_type, 
-                    'active_power_total_kw':         abs(round(fields.get('active_power_total_kw', 0.0), 2)),
+                    'active_power_total_kw': round(fields.get('active_power_total_kw', 0.0) * -1, 2),
                     'reactive_power_total_kvar':      round(fields.get('reactive_power_total_kvar', 0.0), 2),
                     'apparent_power_total_kva':       round(fields.get('apparent_power_total_kva', 0.0), 2),
                     'energy_active_export_kwh':       corrected_export_kwh,
