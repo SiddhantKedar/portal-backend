@@ -27,6 +27,21 @@ GENERATION_STOP_GAP_SECONDS = 120
 EXPORT_THRESHOLD_KW = -1.0
 
 
+# -------- Inverter status mapping ----------
+# Canonical inverter_status codes (single-value, per handoff spec):
+#   0=Stopped (normal night state, NOT a fault), 1=Running, 2=Standby,
+#   4=Warning, 8=Fault. Multi-bit combos aren't emitted yet → 'Unknown'.
+_INVERTER_STATUS_LABELS = {0: 'Stopped', 1: 'Running', 2: 'Standby', 4: 'Warning', 8: 'Fault'}
+
+# Fixed output buckets for the plant-overview state tally (online subset only).
+# Absent/unrecognized status → 'other', so the six always sum to `online`.
+_INVERTER_STATE_KEYS = {0: 'stopped', 1: 'running', 2: 'standby', 4: 'warning', 8: 'fault'}
+
+
+def _inverter_status_label(code):
+    return _INVERTER_STATUS_LABELS.get(code, 'Unknown')
+
+
 # ── Timezone Helper ────────────────────────────────────────────────────────────
 
 def get_ist_midnight_utc():
@@ -625,8 +640,9 @@ def _query_meter_live(query_api, bucket, site_id, meter_id):
 def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
     """
     Internal: per-inverter live snapshot for the plant overview.
-      device_data  — fresh only (ac_active_power_kw, dc_input_power_kw); drives
-                     online/offline and the instantaneous values.
+      device_data  — fresh only (ac_active_power_kw, dc_input_power_kw,
+                     inverter_status); drives online/offline and the
+                     instantaneous values.
       device_last  — last-known energy_total_kwh, UNGATED, so the lifetime
                      counter persists while the inverter is offline (same
                      fresh/last-known split as get_inverter_overview).
@@ -647,7 +663,8 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
             |> filter(fn: (r) =>
                 r._field == "ac_active_power_kw" or
                 r._field == "dc_input_power_kw" or
-                r._field == "energy_total_kwh"
+                r._field == "energy_total_kwh" or
+                r._field == "inverter_status"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -909,8 +926,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             voltage_ab, voltage_bc, voltage_ca,
             current_a, current_b, current_c,
         },
-        inverters: [ { name, device_id, active_power_kw,
-                       daily_gen_kwh, status, last_updated } ],
+        inverters: [ { name, device_id, active_power_kw, daily_gen_kwh,
+                       total_gen_kwh, status, inverter_status, last_updated } ],
         device_summary: { total, online, offline },
         weather: {
             irradiation_inclined_wm2, ambient_temp_c, module_temp_c, status,
@@ -949,6 +966,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         inverter_list = []
         online_count  = 0
         total_dc_power = 0.0
+        state_counts  = {'running': 0, 'stopped': 0, 'standby': 0,
+                         'warning': 0, 'fault': 0, 'other': 0}
 
         for device_id in inverter_ids:
             fields    = inv_data.get(device_id, {})
@@ -956,9 +975,25 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             t         = inv_times.get(device_id)
             is_online = bool(fields)
 
+            # Device-reported state, live-only: present only when a FRESH
+            # inverter_status was captured (fields is already fresh-gated).
+            # Offline or not-emitted → None. Orthogonal to online/offline.
+            raw_status = fields.get('inverter_status')
+            if raw_status is not None:
+                code = int(round(raw_status))
+                inverter_status = {'code': code, 'label': _inverter_status_label(code)}
+            else:
+                inverter_status = None
+
             if is_online:
                 online_count += 1
                 total_dc_power += fields.get('dc_input_power_kw', 0.0)
+                # State tally — online subset only (offline reports no state;
+                # covered by device_summary.offline). Absent/unrecognized → 'other'.
+                key = _INVERTER_STATE_KEYS.get(
+                    inverter_status['code'] if inverter_status else None, 'other'
+                )
+                state_counts[key] += 1
 
             # e_today: calculated last−first (not the retired energy_daily_kwh).
             # e_total: last-known lifetime, ungated → persists while offline.
@@ -971,6 +1006,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'daily_gen_kwh':   round(daily_gen, 3),
                 'total_gen_kwh':   round(total_gen, 2),
                 'status':          'online' if is_online else 'offline',
+                'inverter_status': inverter_status,
                 'last_updated':    t.isoformat() if t else None,
             })
 
@@ -1034,6 +1070,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'total':   total_inverters,
                 'online':  online_count,
                 'offline': total_inverters - online_count,
+                'states':  state_counts,
             },
 
             'meter': {
@@ -1257,7 +1294,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
     Fields fetched per inverter (live snapshot):
         ac_active_power_kw, energy_total_kwh,
         grid_frequency_hz, ac_power_factor, ac_reactive_power_kvar,
-        inverter_efficiency_pct
+        inverter_efficiency_pct, inverter_status
 
     Daily energy is NOT read from energy_daily_kwh (unreliable/self-resetting,
     and absent entirely on newer sites). Derived instead as last-minus-first
@@ -1288,7 +1325,8 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 r._field == "grid_frequency_hz"        or
                 r._field == "ac_power_factor"          or
                 r._field == "ac_reactive_power_kvar"   or
-                r._field == "inverter_efficiency_pct"
+                r._field == "inverter_efficiency_pct"  or
+                r._field == "inverter_status"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -1354,6 +1392,8 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
         total_active_power   = 0.0
         total_daily_gen      = 0.0
         online_count         = 0
+        state_counts         = {'running': 0, 'stopped': 0, 'standby': 0,
+            'warning': 0, 'fault': 0, 'other': 0}
 
         dc_capacity_per_inverter = (
             float(dc_capacity_kw) / len(inverter_ids)
@@ -1368,8 +1408,23 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             t         = device_times.get(device_id)
             is_online = bool(fields)
 
+            # Device-reported state, live-only (fields is fresh-gated). Offline
+            # or not-emitted → None. Orthogonal to online/offline — same axis
+            # split as plant overview.
+            raw_status = fields.get('inverter_status')
+            if raw_status is not None:
+                code = int(round(raw_status))
+                inverter_status = {'code': code, 'label': _inverter_status_label(code)}
+            else:
+                inverter_status = None
+
             if is_online:
                 online_count += 1
+                # State tally — online subset only; sums to online_count.
+                key = _INVERTER_STATE_KEYS.get(
+                    inverter_status['code'] if inverter_status else None, 'other'
+                )
+                state_counts[key] += 1
 
             active_power = abs(round(fields.get('ac_active_power_kw', 0.0), 2))
             daily_gen    = abs(daily_energy_by_device.get(device_id, 0.0))
@@ -1400,6 +1455,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 'inverter_efficiency_pct': round(fields.get('inverter_efficiency_pct', 0.0), 1),
                 'performance_ratio_pct':   inverter_pr_pct,
                 'status':                  'online' if is_online else 'offline',
+                'inverter_status':         inverter_status,
                 'last_updated':            t.isoformat() if t else None,
             })
 
@@ -1415,6 +1471,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 'total_energy_daily_kwh':   round(total_daily_gen, 3),
                 'online_count':             online_count,
                 'total_count':              len(inverter_ids),
+                'states':                   state_counts,
                 'performance_ratio_pct':    fleet_pr_pct,
                 'poa_irradiation_kwh_m2':   poa_kwh_m2,
             },
