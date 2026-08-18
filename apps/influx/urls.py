@@ -10,6 +10,7 @@ from .meter_views import MeterOverviewView
 from .analytics_views import AnalyticsMetricsListView, AnalyticsView
 from .portfolio_view import PortfolioOverviewView
 from .weather_views import WeatherSnapshotView
+from .faults_views import InverterFaultsView
 
 from .temp_inverter_status_views import TempInverterStatusView
 
@@ -48,6 +49,9 @@ urlpatterns = [
 
     # Weather station Page
     path('weather/', WeatherSnapshotView.as_view()),
+
+    # Inverter faults / status-timeline page
+    path('faults/', InverterFaultsView.as_view()),
 
     # TEMP — admin inverter_status monitor. Delete this line + the temp file
     # once the inverter_status field is confirmed working.

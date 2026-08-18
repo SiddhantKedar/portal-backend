@@ -2155,7 +2155,10 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
     """
     empty = {
         'active_power_kw': 0.0, 'meter_online': False,
-        'inverters_online': 0, 'inverters_total': 0, 'last_updated': None,
+        'inverters_online': 0, 'inverters_total': 0,
+        'states': {'running': 0, 'stopped': 0, 'standby': 0,
+                   'warning': 0, 'fault': 0, 'other': 0},
+        'last_updated': None,
     }
     if not site_ids:
         return {}
@@ -2181,7 +2184,8 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
             |> filter(fn: (r) => {device_filter})
             |> filter(fn: (r) =>
                 r._field == "active_power_total_kw" or
-                r._field == "ac_active_power_kw"
+                r._field == "ac_active_power_kw"  or
+                r._field == "inverter_status"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
             |> last()
@@ -2210,11 +2214,27 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
         raw_power = meter_rec.get('active_power_total_kw', 0.0)
         active_power_kw = 0.0 if raw_power > 0 else round(raw_power * -1, 2)
 
+        # One pass over this site's inverters: a fresh record = online (same count
+        # as before); tally its device-reported state alongside. states sums to
+        # inverters_online — offline inverters report no state, same as elsewhere.
+        online = 0
+        states = {'running': 0, 'stopped': 0, 'standby': 0,
+                  'warning': 0, 'fault': 0, 'other': 0}
+        for inv_id in inv_ids:
+            inv_rec = raw.get((influx_site_id, inv_id))
+            if not inv_rec:
+                continue
+            online += 1
+            raw_status = inv_rec.get('inverter_status')
+            code = int(round(raw_status)) if raw_status is not None else None
+            states[_INVERTER_STATE_KEYS.get(code, 'other')] += 1
+
         results[influx_site_id] = {
             'active_power_kw':  active_power_kw,
             'meter_online':     bool(meter_rec),
-            'inverters_online': sum(1 for inv_id in inv_ids if raw.get((influx_site_id, inv_id))),
+            'inverters_online': online,
             'inverters_total':  len(inv_ids),
+            'states':           states,
             'last_updated':     last_time.isoformat() if last_time else None,
         }
 
@@ -2331,7 +2351,10 @@ def get_portfolio_overview(bucket_groups, include_energy=True):
                 results[site_pk] = {
                     **live.get(influx_site_id, {
                         'active_power_kw': 0.0, 'meter_online': False,
-                        'inverters_online': 0, 'inverters_total': 0, 'last_updated': None,
+                        'inverters_online': 0, 'inverters_total': 0,
+                        'states': {'running': 0, 'stopped': 0, 'standby': 0,
+                                   'warning': 0, 'fault': 0, 'other': 0},
+                        'last_updated': None,
                     }),
                     'energy_today_kwh': (
                         energy.get(influx_site_id, 0.0) if include_energy else None
@@ -2756,3 +2779,190 @@ def _query_generation_window_for_day(query_api, bucket, site_id, meter_id, start
                 end_time = record.get_time()
 
     return start_time, end_time
+
+
+# Faults / inverter_status timeline ------------------------------------------
+
+# Per-minute inverter_status: interior gaps shorter than this are absorbed into
+# the surrounding run (one or two dropped samples shouldn't shatter the bar);
+# longer gaps — and the head/tail of the window — surface as 'No Data', so a
+# stopped-reporting inverter never paints its last state forward across time we
+# know nothing about.
+TIMELINE_GAP_SECONDS = 300
+
+
+def _ist_day_window(date_str=None):
+    """
+    Resolve a 'YYYY-MM-DD' (IST) date to a query window, matching the trend
+    endpoints exactly so pages agree on what a given day means.
+    Returns (start_utc, end_utc, is_today, ist_date_str). end is 'now' for today,
+    else next IST midnight. Raises on a malformed date_str.
+    """
+    ist = timezone(timedelta(hours=5, minutes=30))
+
+    if date_str:
+        try:
+            requested = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=ist)
+        except ValueError:
+            raise Exception(f'Invalid date format: {date_str}. Use YYYY-MM-DD.')
+    else:
+        requested = datetime.now(ist)
+
+    start_ist = requested.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_ist.astimezone(timezone.utc)
+
+    today_ist = datetime.now(ist).replace(hour=0, minute=0, second=0, microsecond=0)
+    is_today  = start_ist.date() == today_ist.date()
+
+    end_utc = (datetime.now(timezone.utc) if is_today
+               else (start_ist + timedelta(days=1)).astimezone(timezone.utc))
+
+    return start_utc, end_utc, is_today, start_ist.strftime('%Y-%m-%d')
+
+
+def _query_inverter_status_series(query_api, bucket, site_id, inverter_ids, start_str, end_str):
+    """
+    Raw inverter_status for the given inverters over [start_str, end_str], grouped
+    by device, ascending. Returns { device_id: [(time, value_float), ...] }.
+    (Graduated from the temporary portfolio probe; bounded window instead of -Nh.)
+    """
+    device_filter = ' or '.join([f'r.device == "{d}"' for d in inverter_ids])
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start_str}, stop: {end_str})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "inverter_status")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> sort(columns: ["_time"])
+    '''
+    out = {}
+    for table in query_api.query(flux, org=INFLUX_ORG):
+        for record in table.records:
+            device = record.values.get('device')
+            value  = record.get_value()
+            time   = record.get_time()
+            if device is None or value is None or time is None:
+                continue
+            out.setdefault(device, []).append((time, value))
+    for dev in out:
+        out[dev].sort(key=lambda p: p[0])
+    return out
+
+
+def _timeline_segment(code, start, end):
+    """One contiguous segment. code=None → 'No Data' (no reading for this span),
+    distinct from an unrecognized code → 'Unknown'."""
+    return {
+        'code':  code,
+        'label': 'No Data' if code is None else _inverter_status_label(code),
+        'start': start.isoformat(),
+        'end':   end.isoformat(),
+    }
+
+
+def _build_inverter_timeline(samples, window_start, window_end, gap_seconds=TIMELINE_GAP_SECONDS):
+    """
+    samples: [(time, value_float), ...] ascending, ONE device, inside the window.
+    Returns contiguous, hole-free segments spanning [window_start, window_end]:
+    collapsed state runs interleaved with synthetic 'No Data' for gaps > gap_seconds
+    and for a late start / early stop.
+
+    Boundaries: a state change with no gap is dated at the FIRST sample of the new
+    state (the exact transition between two 1-min samples is unknown). A gap closes
+    the prior run at its LAST seen sample — we only claim the state held as long as
+    we actually saw it, which is what stops a stale state extending to 'now'.
+    """
+    gap = timedelta(seconds=gap_seconds)
+
+    if not samples:
+        return [_timeline_segment(None, window_start, window_end)]
+
+    segments = []
+    first_t = samples[0][0]
+    if first_t - window_start > gap:
+        segments.append(_timeline_segment(None, window_start, first_t))
+        run_start = first_t
+    else:
+        run_start = window_start
+
+    run_code = int(round(samples[0][1]))
+    prev_t   = first_t
+
+    for t, v in samples[1:]:
+        code = int(round(v))
+        if t - prev_t > gap:
+            segments.append(_timeline_segment(run_code, run_start, prev_t))
+            segments.append(_timeline_segment(None, prev_t, t))
+            run_code, run_start = code, t
+        elif code != run_code:
+            segments.append(_timeline_segment(run_code, run_start, t))
+            run_code, run_start = code, t
+        prev_t = t
+
+    if window_end - prev_t > gap:
+        segments.append(_timeline_segment(run_code, run_start, prev_t))
+        segments.append(_timeline_segment(None, prev_t, window_end))
+    else:
+        segments.append(_timeline_segment(run_code, run_start, window_end))
+
+    return segments
+
+
+def get_inverter_faults(bucket, site_id, inverter_ids, date_str=None):
+    """
+    Per-inverter inverter_status timeline for one site, for a single IST day.
+
+    current  — freshness-gated (_is_fresh) latest state, TODAY only; None when
+               stale or for a past date. The overview page owns online/offline,
+               so a stale inverter here simply has no current state.
+    timeline — contiguous segments (state runs + 'No Data' gaps) across the whole
+               window; a stopped-reporting inverter tails into No Data, never its
+               last state frozen forward.
+
+    Forward-compatible: a segment can later gain a 'faults' list (specific bits)
+    without reshaping.
+    """
+    start_utc, end_utc, is_today, date_iso = _ist_day_window(date_str)
+    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    try:
+        samples_by_device = _query_inverter_status_series(
+            query_api, bucket, site_id, inverter_ids, start_str, end_str
+        )
+        client.close()
+
+        inverter_list = []
+        for device_id in inverter_ids:
+            samples  = samples_by_device.get(device_id, [])
+            timeline = _build_inverter_timeline(samples, start_utc, end_utc)
+
+            current = None
+            if is_today and samples:
+                last_t, last_v = samples[-1]
+                if _is_fresh(last_t):
+                    code = int(round(last_v))
+                    current = {'code': code, 'label': _inverter_status_label(code)}
+
+            inverter_list.append({
+                'device_id': device_id,
+                'current':   current,
+                'timeline':  timeline,
+            })
+
+        return {
+            'date':      date_iso,
+            'is_today':  is_today,
+            'window':    {'start': start_utc.isoformat(), 'end': end_utc.isoformat()},
+            'gap_threshold_seconds': TIMELINE_GAP_SECONDS,
+            'inverters': inverter_list,
+        }
+
+    except Exception as e:
+        client.close()
+        raise Exception(f'Inverter faults query failed: {str(e)}')
