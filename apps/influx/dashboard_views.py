@@ -13,6 +13,46 @@ from apps.sites.models import Device
 
 from .queries import get_daily_energy, get_plant_overview, get_plant_power_trend, get_plant_electrical_trend
 
+from datetime import datetime, timedelta, timezone as dt_timezone
+from django.db.models import Sum
+
+from apps.reports.models import DailySiteSnapshot
+
+
+# Helper 
+def _month_to_date_energy_kwh(site, today_energy_kwh):
+    """
+    Month-to-date generation (kWh) for the plant overview.
+
+    Postgres sum of stored daily snapshots from the 1st of the IST month
+    through YESTERDAY (~30 tiny rows, indexed on site+date), plus TODAY's
+    live meter energy already computed by get_plant_overview. Deliberately
+    does NOT re-scan Influx per poll — the whole point is to stay cheap under
+    hundreds of concurrent users.
+
+    Both halves are meter-based (energy_active_export_kwh last−first), so the
+    day boundary is seamless — snapshot.energy_today_kwh and the overview's
+    plant.energy_today_kwh are the same quantity for different days.
+
+    v1 caveat: a day whose meter comms were fully down is stored NULL and
+    SUM skips it, so the total can UNDER-count by that day — never over.
+    Killed later by storing the meter's lifetime counter nightly and taking a
+    single Postgres last−first instead of summing days.
+    """
+    ist = dt_timezone(timedelta(hours=5, minutes=30))
+    today_ist = datetime.now(ist).date()
+    month_start = today_ist.replace(day=1)
+
+    # 1st of month → yesterday. date__lt=today excludes today; on the 1st this
+    # range is empty (Sum → None), so month-to-date correctly == today.
+    prior = DailySiteSnapshot.objects.filter(
+        site=site, date__gte=month_start, date__lt=today_ist
+    ).aggregate(total=Sum('energy_today_kwh'))['total']
+
+    # Sum returns a Decimal (or None); cast before adding the float today value.
+    prior_kwh = float(prior) if prior is not None else 0.0
+    return round(prior_kwh + (today_energy_kwh or 0.0), 2)
+
 
 class DailyEnergyView(TenantFilterMixin, APIView):
     """
@@ -151,9 +191,19 @@ class PlantOverviewView(TenantFilterMixin, APIView):
             for inv in data['inverters']:
                 inv['name'] = name_map.get(inv['device_id'], inv['device_id'])
 
-            # Serialize last_updated if it's a datetime object
+                        # Serialize last_updated if it's a datetime object
             if data.get('last_updated') and hasattr(data['last_updated'], 'isoformat'):
                 data['last_updated'] = data['last_updated'].isoformat()
+
+            # Month-to-date generation — cheap Postgres sum + today's live figure.
+            # Guarded so a snapshot/DB hiccup nulls the field (frontend renders —)
+            # instead of 500-ing the whole live page over a nice-to-have number.
+            try:
+                data['plant']['energy_month_kwh'] = _month_to_date_energy_kwh(
+                    site, data['plant'].get('energy_today_kwh', 0.0)
+                )
+            except Exception:
+                data['plant']['energy_month_kwh'] = None
 
             return Response({
                 'site': site.name,

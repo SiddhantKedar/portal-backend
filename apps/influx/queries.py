@@ -1185,45 +1185,6 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
 
 # ── Inverter Overview Queries ──────────────────────────────────────────────────
 
-def _query_inverters_energy_integral(query_api, bucket, site_id, inverter_ids):
-    """
-    Internal (TEST): energy today per inverter via time-integral of
-    ac_active_power_kw since IST midnight (E = ∫P dt). Alternative to the counter
-    last-minus-first, for old inverters whose energy_total_kwh only ticks in
-    coarse 100 kWh steps. Grouped by device so N inverters cost one query.
-
-    Returns { device_id: energy_kwh_today }. Devices with no data are omitted
-    (caller should .get(id, 0.0)).
-    """
-    start = get_ist_midnight_utc()
-    device_filter = ' or '.join(
-        [f'r.device == "{d}"' for d in inverter_ids]
-    )
-
-    flux = f'''
-        from(bucket: "{bucket}")
-            |> range(start: {start})
-            |> filter(fn: (r) => r._measurement == "solar_data")
-            |> filter(fn: (r) => r.site == "{site_id}")
-            |> filter(fn: (r) => {device_filter})
-            |> filter(fn: (r) => r._field == "ac_active_power_kw")
-            |> filter(fn: (r) => exists r._value)
-            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-            |> map(fn: (r) => ({{r with _value: if r._value < 0.0 then 0.0 else r._value}}))
-            |> group(columns: ["device", "_start", "_stop"])
-            |> integral(unit: 1h)
-    '''
-
-    result = {}
-    tables = query_api.query(flux, org=INFLUX_ORG)
-    for table in tables:
-        for record in table.records:
-            device = record.values.get('device')
-            value  = record.get_value()
-            if device is not None and value is not None:
-                result[device] = round(value, 3)
-
-    return result
 
 def _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids):
     """
@@ -1350,9 +1311,6 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             query_api, bucket, site_id, inverter_ids
         )
 
-        integral_energy_by_device = _query_inverters_energy_integral(
-            query_api, bucket, site_id, inverter_ids
-        )
 
         client.close()
 
@@ -1442,9 +1400,6 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 'device_id':               device_id,
                 'ac_active_power_kw':      active_power,
                 'energy_daily_kwh':        round(daily_gen, 3),
-                'energy_today_integral_kwh': round(
-                    integral_energy_by_device.get(device_id, 0.0), 3
-                ),
                 'energy_total_kwh':        (
                     abs(round(last_fields['energy_total_kwh'], 2))
                     if 'energy_total_kwh' in last_fields else 0.0

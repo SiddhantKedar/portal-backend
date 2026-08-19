@@ -20,9 +20,9 @@
 # One user failing never stops the rest. Non-zero exit if any send failed.
 
 import sys
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
 
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import BaseCommand
 
 from apps.users.models import User
 from apps.sites.models import Site, Device
@@ -30,7 +30,8 @@ from apps.influx.client import get_influx_client
 from apps.influx.queries import (
     _resolve_ist_date_range,
     MIN_POA_KWH_M2_FOR_PR,
-    # TEMP (v1 reuse): borrowed from the snapshot + live paths.
+    # Shared with the snapshot + live portal paths — one source of truth for
+    # meter-energy / liveness / POA. Deliberately reused, not throwaway.
     _query_meter_energy_for_day,
     _query_meter_live,
     _query_poa_irradiation_for_day,
@@ -38,7 +39,7 @@ from apps.influx.queries import (
 
 # AiSensy campaign name for the approved daily-report template.
 # NOTE: must match the campaign name in the AiSensy dashboard exactly.
-CAMPAIGN_NAME = 'daily_gen_v2'  # TEMP: swap to the real 6-param greeting campaign once approved
+CAMPAIGN_NAME = 'daily_gen_v2'  # NOTE : must match the campaign name in the AiSensy dashboard exactly.
 
 
 def _fmt_num(value, decimals=1, zero_ok=False):
@@ -67,12 +68,8 @@ class Command(BaseCommand):
         site_pk = options.get('site')
         dry_run = options.get('dry_run')
 
-        # Import here so a missing key / requests issue surfaces as a clean
-        # command error rather than an import-time crash.
         from core.whatsapp import send_template
 
-        # --- Recipients: SITE_USERs with a real number and an assigned site.
-        #     whatsapp_number is stored bare (no '+'); '' / None both mean opt-out.
         recipients = User.objects.filter(
             role='SITE_USER',
             site__isnull=False,
@@ -91,12 +88,8 @@ class Command(BaseCommand):
             self.stdout.write('No SITE_USER recipients with a WhatsApp number found.')
             return
 
-        # Live window: today, IST midnight -> now, as the RFC3339 UTC strings
-        # the _for_day queries expect. date_str=None => today, end capped at now.
-        start, end = _resolve_ist_date_range(None)
+        start, end = _resolve_ist_date_range(None)  # today, IST midnight -> now
 
-        # Reporting date label in IST, e.g. "11 Aug 2026".
-        from datetime import timedelta
         ist_tz = dt_timezone(timedelta(hours=5, minutes=30))
         date_label = datetime.now(ist_tz).strftime('%d %b %Y')
 
@@ -105,60 +98,77 @@ class Command(BaseCommand):
             f'Sending to {len(recipients)} SITE_USER(s) for {date_label}...'
         )
 
-        sent = 0
-        failed = 0
-        skipped = 0
+        sent = failed = skipped = 0
 
-        for user in recipients:
-            site = user.site
+        # One Influx client for the whole batch; metrics computed once per unique
+        # site and reused across all its SITE_USERs. Cached value is either the
+        # (energy, cuf, pr) tuple or the Exception that failed that site.
+        metrics_cache = {}
+        client = get_influx_client()
+        try:
+            query_api = client.query_api()
 
-            # Only GENERATION sites produce a report. A SITE_USER should always
-            # point at a GENERATION site, but guard anyway.
-            if site.site_type != Site.SiteType.GENERATION:
-                skipped += 1
-                self.stdout.write(self.style.WARNING(
-                    f'[{user.pk}] {user.email} — site "{site.name}" is not GENERATION; skipped.'
-                ))
-                continue
+            for user in recipients:
+                site = user.site
 
-            try:
-                energy_kwh, cuf_pct, pr_pct = self._live_metrics(site, start, end)
-            except Exception as e:
-                failed += 1
-                self.stderr.write(self.style.ERROR(
-                    f'[{user.pk}] {user.email} — {site.name}: data query FAILED — {e}'
-                ))
-                continue
+                if site.site_type != Site.SiteType.GENERATION:
+                    skipped += 1
+                    self.stdout.write(self.style.WARNING(
+                        f'[{user.pk}] {user.email} — site "{site.name}" is not GENERATION; skipped.'
+                    ))
+                    continue
 
-            name = f'{user.first_name} {user.last_name}'.strip() or 'Customer'
-            params = [
-                name,                                   # {{1}}
-                site.name,                              # {{2}}
-                date_label,                             # {{3}}
-                _fmt_num(energy_kwh, 1, zero_ok=True),  # {{4}} energy kWh — real 0 shows 0.0
-                _fmt_num(cuf_pct, 1),                   # {{5}} CUF %  (0/None -> '-')
-                _fmt_num(pr_pct, 1),                    # {{6}} PR %   (0/None -> '-', live-gated)
-            ]
+                if site.pk not in metrics_cache:
+                    try:
+                        metrics_cache[site.pk] = self._metrics_for_site(
+                            query_api, site, start, end
+                        )
+                    except Exception as e:
+                        metrics_cache[site.pk] = e
 
-            if dry_run:
-                self.stdout.write(
-                    f'[{user.pk}] {user.email} -> {user.whatsapp_number} | {params}'
+                result = metrics_cache[site.pk]
+                if isinstance(result, Exception):
+                    failed += 1
+                    self.stderr.write(self.style.ERROR(
+                        f'[{user.pk}] {user.email} — {site.name}: data query FAILED — {result}'
+                    ))
+                    continue
+
+                energy_kwh, cuf_pct, pr_pct = result
+
+                name = f'{user.first_name} {user.last_name}'.strip() or 'Customer'
+                params = [
+                    name,                                   # {{1}}
+                    site.name,                              # {{2}}
+                    date_label,                             # {{3}}
+                    _fmt_num(energy_kwh, 1, zero_ok=True),  # {{4}} energy kWh
+                    _fmt_num(cuf_pct, 1),                   # {{5}} CUF %
+                    _fmt_num(pr_pct, 1),                    # {{6}} PR %
+                ]
+
+                if dry_run:
+                    self.stdout.write(
+                        f'[{user.pk}] {user.email} -> {user.whatsapp_number} | {params}'
+                    )
+                    sent += 1
+                    continue
+
+                ok, detail = send_template(
+                    user.whatsapp_number, CAMPAIGN_NAME, params, user_name=name
                 )
-                sent += 1
-                continue
-
-            ok, detail = send_template(user.whatsapp_number, CAMPAIGN_NAME, params)
-            if ok:
-                sent += 1
-                self.stdout.write(self.style.SUCCESS(
-                    f'[{user.pk}] {user.email} -> {user.whatsapp_number}: sent '
-                    f'(energy={params[3]}, cuf={params[4]})'
-                ))
-            else:
-                failed += 1
-                self.stderr.write(self.style.ERROR(
-                    f'[{user.pk}] {user.email} -> {user.whatsapp_number}: FAILED — {detail}'
-                ))
+                if ok:
+                    sent += 1
+                    self.stdout.write(self.style.SUCCESS(
+                        f'[{user.pk}] {user.email} -> {user.whatsapp_number}: sent '
+                        f'(energy={params[3]}, cuf={params[4]})'
+                    ))
+                else:
+                    failed += 1
+                    self.stderr.write(self.style.ERROR(
+                        f'[{user.pk}] {user.email} -> {user.whatsapp_number}: FAILED — {detail}'
+                    ))
+        finally:
+            client.close()
 
         verb = 'would send' if dry_run else 'sent'
         summary = f'Done. {sent} {verb}, {skipped} skipped, {failed} failed.'
@@ -166,18 +176,15 @@ class Command(BaseCommand):
             self.stderr.write(self.style.ERROR(summary))
             sys.exit(1)
         self.stdout.write(self.style.SUCCESS(summary))
+        
 
-    def _live_metrics(self, site, start, end):
+    def _metrics_for_site(self, query_api, site, start, end):
         """
-        Live energy-today (midnight IST -> now), CUF, and PR for one site.
-        Reuses the snapshot's meter-energy + POA queries and the live meter
-        query, with PR gated to match get_plant_overview exactly.
+        Live energy-today (IST midnight -> now), CUF, and PR for one site, using a
+        shared query_api (client lifecycle owned by the caller). PR gated to match
+        get_plant_overview exactly.
 
         Returns (energy_kwh | None, cuf_pct | None, pr_pct | None).
-        - energy_kwh: last-first of export counter; persists through a brief blip.
-        - cuf_pct: pure function of energy; None if energy None or no ac_capacity.
-        - pr_pct: gated — None unless meter live now AND dc_capacity set AND
-          POA >= MIN_POA_KWH_M2_FOR_PR AND weather reported. Matches portal gate.
         """
         bucket = site.customer.influx_bucket
         site_id = site.influx_site_id
@@ -192,38 +199,26 @@ class Command(BaseCommand):
             site=site, device_type='WEATHER_STATION', is_active=True
         ).first()
 
-        client = get_influx_client()
-        query_api = client.query_api()
-        try:
-            # TEMP (v1 reuse): energy-so-far, midnight->now.
-            energy_kwh, _meter_status = _query_meter_energy_for_day(
-                query_api, bucket, site_id, meter.influx_device_id, start, end
+        energy_kwh, _meter_status = _query_meter_energy_for_day(
+            query_api, bucket, site_id, meter.influx_device_id, start, end
+        )
+
+        meter_data, _meter_time, _meter_last = _query_meter_live(
+            query_api, bucket, site_id, meter.influx_device_id
+        )
+        meter_is_live = bool(meter_data)
+
+        poa_kwh_m2 = None
+        if weather_device:
+            poa_wh_m2 = _query_poa_irradiation_for_day(
+                query_api, bucket, site_id, weather_device.influx_device_id, start, end
             )
+            poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
 
-            # Meter live NOW? (fresh subset non-empty) — PR gate condition 1.
-            meter_data, _meter_time, _meter_last = _query_meter_live(
-                query_api, bucket, site_id, meter.influx_device_id
-            )
-            meter_is_live = bool(meter_data)
-
-            # POA since midnight (Wh/m² -> kWh/m²) — PR gate conditions 3 & 4.
-            poa_kwh_m2 = None
-            if weather_device:
-                poa_wh_m2 = _query_poa_irradiation_for_day(
-                    query_api, bucket, site_id, weather_device.influx_device_id, start, end
-                )
-                poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
-        finally:
-            client.close()
-
-        # CUF — pure function of energy, ungated.
         cuf_pct = None
         if energy_kwh is not None and site.ac_capacity_kw:
-            cuf_pct = round(
-                (energy_kwh / (float(site.ac_capacity_kw) * 24)) * 100, 2
-            )
+            cuf_pct = round((energy_kwh / (float(site.ac_capacity_kw) * 24)) * 100, 2)
 
-        # PR — same four-part gate as get_plant_overview. None (=> "-") if any fails.
         pr_pct = None
         if (
             meter_is_live
