@@ -10,17 +10,22 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 AISENSY_URL = "https://backend.aisensy.com/campaign/t1/api/v2"
-SENDER_NAME = "Enerlynx Private Limited"  # AiSensy 'userName' (sender display)
 REQUEST_TIMEOUT_SECONDS = 15
+# NOTE : no sender-name field exists. AiSensy's `userName` is the RECIPIENT
+# contact name; sender is fixed by the connected WhatsApp number. (SENDER_NAME removed.)
 
 
-def send_template(destination, campaign_name, template_params, fallback_values=None):
+def send_template(destination, campaign_name, template_params,
+                  user_name=None, fallback_values=None):
     """
     Send an approved AiSensy template.
 
     destination:      WhatsApp number, country code + number, no '+' (e.g. 918424882274).
     campaign_name:    AiSensy campaign name (must match the dashboard, not the template name).
     template_params:  list of strings, positional for {{1}}, {{2}}, ...
+    user_name:        AiSensy CONTACT name for this destination — AiSensy creates/updates
+                      the contact under this name, so pass the recipient's real name.
+                      Falls back to the destination number if omitted.
     fallback_values:  optional dict for paramsFallbackValue.
 
     Returns (ok: bool, detail: str). Never raises — logs and returns False on failure,
@@ -40,7 +45,7 @@ def send_template(destination, campaign_name, template_params, fallback_values=N
         "apiKey": api_key,
         "campaignName": campaign_name,
         "destination": dest,
-        "userName": SENDER_NAME,
+        "userName": (user_name or dest),   # AiSensy contact name, NOT a sender field
         "templateParams": [str(p) for p in template_params],
         "source": "enerlynx-backend",
     }

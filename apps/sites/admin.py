@@ -13,9 +13,10 @@ class CustomerAdmin(admin.ModelAdmin):
 
 @admin.register(Site)
 class SiteAdmin(admin.ModelAdmin):
-    list_display  = ('name', 'site_type', 'parent_site', 'customer', 'installer', 'location', 'influx_site_id', 'is_active')
+    list_display  = ('pk','name', 'site_type', 'parent_site', 'customer', 'installer', 'location', 'influx_site_id', 'is_active')
     list_filter   = ('is_active', 'site_type', 'installer')   # filter by installer moved here
     search_fields = ('name', 'influx_site_id')
+    list_display_links  = ('name',)
 
 
 @admin.register(Device)
