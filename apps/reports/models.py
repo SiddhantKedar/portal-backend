@@ -12,6 +12,13 @@ class DailySiteSnapshot(models.Model):
         max_digits=10, decimal_places=3, null=True
     )
 
+    energy_active_export_kwh = models.DecimalField(
+        max_digits=16, decimal_places=2, null=True, blank=True,
+        help_text="End-of-day raw meter export counter (odometer). Cumulative "
+                "lifetime, NOT offset-corrected. NULL when the meter reported "
+                "nothing that day. Basis for month-to-date via Postgres last and first."
+    )
+
     performance_ratio_pct = models.DecimalField(max_digits=7, decimal_places=2, null=True)
     cuf_pct = models.DecimalField(max_digits=6, decimal_places=2, null=True)
     poa_irradiation_kwh_m2 = models.DecimalField(max_digits=8, decimal_places=4, null=True)
