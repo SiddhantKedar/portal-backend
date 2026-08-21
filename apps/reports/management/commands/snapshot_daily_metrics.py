@@ -163,7 +163,7 @@ class Command(BaseCommand):
         query_api = client.query_api()
 
         try:
-            energy_kwh, meter_status, meter_counter_kwh = _query_meter_energy_for_day(
+            energy_kwh, meter_status, meter_open_kwh, meter_close_kwh = _query_meter_energy_for_day(
                 query_api, bucket, site_id, meter.influx_device_id, start, end
             )
 
@@ -223,7 +223,8 @@ class Command(BaseCommand):
             date=date_str,
             defaults={
                 'energy_today_kwh': _dec(energy_kwh),
-                'energy_active_export_kwh': _dec(meter_counter_kwh),
+                'energy_active_export_open_kwh': _dec(meter_open_kwh),
+                'energy_active_export_kwh':      _dec(meter_close_kwh),
                 'energy_today_inverter_sum_kwh': _dec(inv_sum_kwh),
                 'performance_ratio_pct': _dec(performance_ratio_pct),
                 'cuf_pct': _dec(cuf_pct),

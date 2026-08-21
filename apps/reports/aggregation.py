@@ -50,6 +50,8 @@ def build_site_report(site, start_date, end_date):
         poa     = _f(r.poa_irradiation_kwh_m2)
         co2     = _f(r.co2_avoided_kg)
         peak    = _f(r.peak_power_kw)
+        export_open  = _f(r.energy_active_export_open_kwh)
+        export_close = _f(r.energy_active_export_kwh)
 
         specific_yield = (
             round(energy / dc_cap, 2) if (energy is not None and dc_cap) else None
@@ -67,6 +69,8 @@ def build_site_report(site, start_date, end_date):
         daily.append({
             'date':                    r.date.isoformat(),
             'energy_kwh':              round(energy, 2) if energy is not None else None,
+            'energy_active_export_open_kwh':  round(export_open, 2)  if export_open  is not None else None,
+            'energy_active_export_kwh':       round(export_close, 2) if export_close is not None else None,
             'inverter_sum_kwh':        round(inv_sum, 2) if inv_sum is not None else None,
             'specific_yield_kwh_kwp':  specific_yield,
             'performance_ratio_pct':   pr,
