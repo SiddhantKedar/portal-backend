@@ -199,7 +199,7 @@ class Command(BaseCommand):
             site=site, device_type='WEATHER_STATION', is_active=True
         ).first()
 
-        energy_kwh, _meter_status, _meter_counter = _query_meter_energy_for_day(
+        energy_kwh, _meter_status, _meter_open, _meter_close = _query_meter_energy_for_day(
             query_api, bucket, site_id, meter.influx_device_id, start, end
         )
 

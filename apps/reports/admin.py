@@ -18,7 +18,7 @@ def _hm_ist(dt):
 class DailySiteSnapshotAdmin(admin.ModelAdmin):
     list_display = (
         'date', 'site', 'customer',
-        'energy','energy_active_export_kwh', 'peak', 'pr', 'cuf',
+        'energy','energy_active_export_open_kwh', 'energy_active_export_kwh', 'peak', 'pr', 'cuf',
         'inverters', 'gen_window', 'status',
     )
     list_filter = ('meter_status', 'site__customer', 'site')

@@ -2432,16 +2432,20 @@ def _query_meter_energy_for_day(query_api, bucket, site_id, meter_id, start, end
     already resolved via _resolve_ist_date_range). Last-minus-first on the
     cumulative export counter, range-bounded — safe for past dates.
 
-    Returns (energy_kwh, status, end_counter_kwh):
-    energy_kwh — the day's generation (lastand first of the export counter):
+    Returns (energy_kwh, status, start_counter_kwh, end_counter_kwh):
+    energy_kwh — the day's generation (last/first of the export counter):
         (float, 'ok')       — trustworthy figure, may legitimately be 0.0
         (None,  'no_data')  — meter reported nothing in this range
         (None,  'anomaly')  — counter went backwards (rollover / meter swap /
                                 bad packet). Never store the delta as a real number.
-    end_counter_kwh — the day's LAST raw export reading (the cumulative odometer
-        at end of day), or None if the meter reported nothing. Raw, NOT
-        offset-corrected. Surfaced even on 'anomaly' — it's the real reading;
-        only the delta is untrustworthy.
+    start_counter_kwh — the day's FIRST raw export reading (odometer at day
+        start); None if the meter reported nothing.
+    end_counter_kwh   — the day's LAST raw export reading (odometer at day end);
+        None if the meter reported nothing.
+    Both are raw, NOT offset-corrected, and are surfaced even on 'anomaly' —
+    they're real meter readings; only the delta between them is untrustworthy.
+    On an 'ok' day, end / start == energy_kwh by construction — which is the
+    whole point: an independent second source to catch a bad daily figure.
     """
     flux_first = f'''
         from(bucket: "{bucket}")
@@ -2477,18 +2481,17 @@ def _query_meter_energy_for_day(query_api, bucket, site_id, meter_id, start, end
         for record in table.records:
             last_val = record.get_value()
 
-    end_counter = round(last_val, 2) if last_val is not None else None
+    start_counter = round(first_val, 2) if first_val is not None else None
+    end_counter   = round(last_val, 2)  if last_val  is not None else None
 
     if first_val is None or last_val is None:
-        return None, 'no_data', end_counter
+        return None, 'no_data', start_counter, end_counter
 
     delta = last_val - first_val
     if delta < 0:
-        # Cumulative counter moved backwards — never a valid generation figure.
-        # Flag the delta as anomaly, but still surface the real end_counter.
-        return None, 'anomaly', end_counter
+        return None, 'anomaly', start_counter, end_counter
 
-    return round(delta, 3), 'ok', end_counter
+    return round(delta, 3), 'ok', start_counter, end_counter
 
 
 def _query_poa_irradiation_for_day(query_api, bucket, site_id, device_id, start, end):

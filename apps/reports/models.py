@@ -12,6 +12,14 @@ class DailySiteSnapshot(models.Model):
         max_digits=10, decimal_places=3, null=True
     )
 
+    energy_active_export_open_kwh = models.DecimalField(
+    max_digits=16, decimal_places=2, null=True, blank=True,
+    help_text="Day-start raw meter export counter (odometer at 00:00). "
+                "Cumulative lifetime, NOT offset-corrected. NULL when the meter "
+                "reported nothing. Pairs with energy_active_export_kwh (day-end); "
+                "close / open == energy_today_kwh on a clean day. Independent "
+                "second source for validating the daily figure."
+    )
     energy_active_export_kwh = models.DecimalField(
         max_digits=16, decimal_places=2, null=True, blank=True,
         help_text="End-of-day raw meter export counter (odometer). Cumulative "
