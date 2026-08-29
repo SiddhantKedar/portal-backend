@@ -954,6 +954,19 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
             )
 
+        # Build the weather block only when the site actually has a station.
+        # None = no station (frontend hides the section); an object with
+        # status:'offline' = station exists but not live right now (still render).
+        weather_block = None
+        if weather_device_id:
+            weather_block = {
+                'irradiation_inclined_wm2': round(weather_fields.get('irradiation_inclined_wm2', 0.0), 2),
+                'ambient_temp_c':           round(weather_fields.get('ambient_temp_c', 0.0), 2),
+                'module_temp_c':            round(weather_fields.get('module_temp_c', 0.0), 2),
+                'status':                   'online' if weather_fields else 'offline',
+                'last_updated':             weather_time.isoformat() if weather_time else None,
+            }
+
         breaker_fields = {}
         if dido_device_id:
             breaker_fields = _query_breaker_live(query_api, bucket, site_id, dido_device_id)
@@ -1078,13 +1091,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'last_updated': meter_time.isoformat() if meter_time else None,
             },
 
-            'weather': {
-                'irradiation_inclined_wm2': round(weather_fields.get('irradiation_inclined_wm2', 0.0), 2),
-                'ambient_temp_c':           round(weather_fields.get('ambient_temp_c', 0.0), 2),
-                'module_temp_c':            round(weather_fields.get('module_temp_c', 0.0), 2),
-                'status':                   'online' if weather_fields else 'offline',
-                'last_updated':             weather_time.isoformat() if weather_time else None,
-            },
+            'weather': weather_block,
 
             'performance': {
                 'performance_ratio_pct':       performance_ratio_pct,

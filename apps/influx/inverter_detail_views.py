@@ -73,8 +73,13 @@ class InverterDetailView(TenantFilterMixin, APIView):
             )
             data['name'] = device.name
 
+            capabilities = {
+                'weather': weather_device is not None,
+            }
+
             return Response({
                 'site': site.name,
+                'capabilities': capabilities,
                 **data,
             })
 

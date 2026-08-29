@@ -71,8 +71,12 @@ class InverterOverviewView(TenantFilterMixin, APIView):
             for inv in data['inverters']:
                 inv['name'] = name_map.get(inv['device_id'], inv['device_id'])
 
+            capabilities = {
+                'weather': weather_device is not None,
+            }
             return Response({
                 'site': site.name,
+                'capabilities': capabilities,
                 **data,
             })
 
