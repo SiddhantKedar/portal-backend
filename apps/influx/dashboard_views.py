@@ -205,9 +205,14 @@ class PlantOverviewView(TenantFilterMixin, APIView):
             except Exception:
                 data['plant']['energy_month_kwh'] = None
 
+            capabilities = {
+                'weather': weather_device is not None,
+            }
+
             return Response({
                 'site': site.name,
                 'customer': site.customer.name,
+                'capabilities': capabilities,
                 **data,
             })
 
