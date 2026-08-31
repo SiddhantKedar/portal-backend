@@ -173,6 +173,10 @@ class PlantOverviewView(TenantFilterMixin, APIView):
             site=site, device_type='DIDO', is_active=True
         ).first()
 
+        transformer_device = Device.objects.filter(
+            site=site, device_type='TRANSFORMER', is_active=True
+        ).first()
+
         try:
             data = get_plant_overview(
                 bucket       = bucket,
@@ -181,9 +185,11 @@ class PlantOverviewView(TenantFilterMixin, APIView):
                 meter_id     = meter.influx_device_id,
                 weather_device_id  = weather_device.influx_device_id if weather_device else None,
                 dido_device_id     = dido_device.influx_device_id if dido_device else None,
+                transformer_device_id = transformer_device.influx_device_id if transformer_device else None,
                 dc_capacity_kw     = site.dc_capacity_kw,
                 ac_capacity_kw     = site.ac_capacity_kw,
                 daily_generation_target_kwh = site.daily_generation_target_kwh,
+                target_cuf_pct = site.target_cuf_pct,
                 meter_energy_offset_kwh = float(meter.energy_offset_kwh),
             )
 
@@ -207,6 +213,7 @@ class PlantOverviewView(TenantFilterMixin, APIView):
 
             capabilities = {
                 'weather': weather_device is not None,
+                'transformer': transformer_device is not None,
             }
 
             return Response({

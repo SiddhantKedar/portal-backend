@@ -902,7 +902,7 @@ def _resolve_ist_date_range(date_str):
     return start_str, end_str
 
 
-def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None):
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None, transformer_device_id=None, target_cuf_pct=None):
     """
     Plant overview — single function, four or five internal queries.
     Returns everything for the plant overview page stat cards,
@@ -954,6 +954,13 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 query_api, bucket, site_id, weather_device_id, get_ist_midnight_utc()
             )
 
+        transformer_fields = {}
+        transformer_time   = None
+        if transformer_device_id:
+            transformer_fields, transformer_time = _query_transformer_live(
+                query_api, bucket, site_id, transformer_device_id
+            )
+
         # Build the weather block only when the site actually has a station.
         # None = no station (frontend hides the section); an object with
         # status:'offline' = station exists but not live right now (still render).
@@ -965,6 +972,20 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'module_temp_c':            round(weather_fields.get('module_temp_c', 0.0), 2),
                 'status':                   'online' if weather_fields else 'offline',
                 'last_updated':             weather_time.isoformat() if weather_time else None,
+            }
+        transformer_block = None
+        if transformer_device_id:
+            transformer_block = {
+                'transformer_oil_temp_c': (
+                    round(transformer_fields['transformer_oil_temp_c'], 2)
+                    if 'transformer_oil_temp_c' in transformer_fields else None
+                ),
+                'transformer_winding_temp_c': (
+                    round(transformer_fields['transformer_winding_temp_c'], 2)
+                    if 'transformer_winding_temp_c' in transformer_fields else None
+                ),
+                'status':       'online' if transformer_fields else 'offline',
+                'last_updated': transformer_time.isoformat() if transformer_time else None,
             }
 
         breaker_fields = {}
@@ -1063,6 +1084,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'dc_capacity_kw':   float(dc_capacity_kw) if dc_capacity_kw else None,
                 'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
                 'daily_generation_target_kwh': float(daily_generation_target_kwh) if daily_generation_target_kwh else None,
+                'target_cuf_pct': float(target_cuf_pct) if target_cuf_pct else None,
                 'energy_active_export_kwh': round(
                     meter_last['energy_active_export_kwh'] + meter_energy_offset_kwh, 2
                 ) if 'energy_active_export_kwh' in meter_last else 0.0,
@@ -1092,6 +1114,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             },
 
             'weather': weather_block,
+
+            'transformer': transformer_block,
 
             'performance': {
                 'performance_ratio_pct':       performance_ratio_pct,
@@ -2403,6 +2427,45 @@ def _query_weather_live(query_api, bucket, site_id, device_id):
                 last_time = t
 
     return weather_data, last_time
+
+
+def _query_transformer_live(query_api, bucket, site_id, device_id):
+    """
+    Internal: fetches live transformer fields, gated on staleness.
+    Returns (fields, last_time) — fields is {} and last_time is None
+    if no fresh data was found. Only fields present in the fresh reading
+    appear in the dict; a missing field is absent → None upstream, never
+    0.0 (0°C is a plausible real temperature, so zero-masking would lie).
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "{device_id}")
+            |> filter(fn: (r) =>
+                r._field == "transformer_oil_temp_c" or
+                r._field == "transformer_winding_temp_c"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    tables           = query_api.query(flux, org=INFLUX_ORG)
+    transformer_data = {}
+    last_time        = None
+
+    for table in tables:
+        for record in table.records:
+            if not _is_fresh(record.get_time()):
+                continue
+
+            transformer_data[record.get_field()] = record.get_value()
+            t = record.get_time()
+            if last_time is None or t > last_time:
+                last_time = t
+
+    return transformer_data, last_time
 
 def _query_poa_irradiation(query_api, bucket, site_id, device_id, start):
     """
