@@ -65,6 +65,7 @@ class InverterOverviewView(TenantFilterMixin, APIView):
                 inverter_ids = inverter_ids,
                 weather_device_id = weather_device_id,
                 dc_capacity_kw    = site.dc_capacity_kw,
+                ac_capacity_kw    = site.ac_capacity_kw,
             )
 
             # Attach human readable names

@@ -1278,7 +1278,7 @@ def _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids):
 
     return result
 
-def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None, dc_capacity_kw=None):
+def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None):
     """
     Fetches all live inverter data in one query.
     Returns summary (totals) + per inverter breakdown.
@@ -1460,6 +1460,8 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 'states':                   state_counts,
                 'performance_ratio_pct':    fleet_pr_pct,
                 'poa_irradiation_kwh_m2':   poa_kwh_m2,
+                'dc_capacity_kw':           float(dc_capacity_kw) if dc_capacity_kw else None,
+                'ac_capacity_kw':           float(ac_capacity_kw) if ac_capacity_kw else None,
             },
             'inverters': inverter_list,
         }
