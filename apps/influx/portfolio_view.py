@@ -41,6 +41,8 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                 'sites_total':            0,
                 'inverters_online':       0,
                 'inverters_total':        0,
+                'loggers_online':         0,
+                'loggers_total':          0,
                 'states': {'running': 0, 'stopped': 0, 'standby': 0,
                             'warning': 0, 'fault': 0, 'other': 0},
 
@@ -116,6 +118,7 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
         total_energy_today     = 0.0
         total_ac_capacity      = 0.0
         sites_online           = 0
+        loggers_online_total   = 0
         inverters_online_total = 0
         inverters_total_total  = 0
         inverters_online_total = 0
@@ -136,15 +139,19 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                 inv_total    = r.get('inverters_total',  0)
                 inv_states   = r.get('states', {'running': 0, 'stopped': 0, 'standby': 0,
                                                 'warning': 0, 'fault': 0, 'other': 0})
+                logger_online    = r.get('logger_online',    False)
+                logger_last_seen = r.get('logger_last_seen')
 
                 total_active_power     += active_power
                 if energy_today is not None:
                     total_energy_today += energy_today
                 total_ac_capacity      += float(site.ac_capacity_kw or 0)
-                if meter_online:
-                    sites_online       += 1
+                if logger_online:
+                    sites_online += 1
                 inverters_online_total += inv_online
                 inverters_total_total  += inv_total
+                if logger_online:
+                    loggers_online_total += 1
                 for k, v in inv_states.items():
                     states_total[k] += v
 
@@ -160,6 +167,8 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                     'inverters_online': inv_online,
                     'inverters_total':  inv_total,
                     'states':           inv_states,
+                    'logger_online':    logger_online,
+                    'logger_last_seen': logger_last_seen,
                     'last_updated':     r.get('last_updated'),
                 })
 
@@ -179,6 +188,8 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                 'sites_total':            len(sites),
                 'inverters_online':       inverters_online_total,
                 'inverters_total':        inverters_total_total,
+                'loggers_online':         loggers_online_total,
+                'loggers_total':          len(sites),
                 'states':                 states_total
             },
             'customers': customers_list,

@@ -637,6 +637,37 @@ def _query_meter_live(query_api, bucket, site_id, meter_id):
     return meter_data, meter_time, meter_last
 
 
+def _query_data_logger(query_api, bucket, site_id):
+    """
+    Internal: data-logger heartbeat for one site.
+      online    = last heartbeat within STALE_AFTER_SECONDS (120s).
+      last_seen = most recent heartbeat within -3h, regardless of freshness, so an
+                  offline logger still reports when it last checked in.
+    Presence-only: the value (always 1) is ignored, only recency matters. Different
+    measurement ("device_info") and device ("data_logger") from solar_data, so it's
+    its own query rather than folded into the meter/inverter reads.
+    """
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -3h)
+            |> filter(fn: (r) => r._measurement == "device_info")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => r.device == "data_logger")
+            |> filter(fn: (r) => r._field == "heartbeat")
+            |> last()
+    '''
+
+    tables      = query_api.query(flux, org=INFLUX_ORG)
+    logger_time = None
+    for table in tables:
+        for record in table.records:
+            t = record.get_time()
+            if logger_time is None or (t and t > logger_time):
+                logger_time = t
+
+    return _is_fresh(logger_time), logger_time
+
+
 def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
     """
     Internal: per-inverter live snapshot for the plant overview.
@@ -994,6 +1025,8 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
 
         generation_window = _query_plant_generation_window(query_api, bucket, site_id, meter_id)
 
+        logger_online, logger_time = _query_data_logger(query_api, bucket, site_id)
+
         client.close()
 
         # Build inverter list
@@ -1111,6 +1144,11 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             'meter': {
                 'status':       'online' if meter_is_live else 'offline',
                 'last_updated': meter_time.isoformat() if meter_time else None,
+            },
+
+            'data_logger': {
+                'status':    'online' if logger_online else 'offline',
+                'last_seen': logger_time.isoformat() if logger_time else None,
             },
 
             'weather': weather_block,
@@ -2292,6 +2330,59 @@ def _query_portfolio_energy_today(query_api, bucket, site_meter_map):
     }
 
 
+def _query_portfolio_logger(query_api, bucket, site_ids):
+    """
+    Data-logger heartbeat for every site in a bucket, one query.
+      logger_online    = last heartbeat within STALE_AFTER_SECONDS (120s).
+      logger_last_seen = most recent heartbeat within -3h, regardless of freshness.
+    Returns: { influx_site_id: { 'logger_online': bool, 'logger_last_seen': iso|None } }
+
+    Resilient: a bucket that doesn't exist yet (placeholder customer) or any Influx
+    error degrades to offline/None for that bucket's sites rather than failing the
+    whole portfolio. The meter/inverter queries skip device-less buckets before
+    touching Influx via their own guards, so this is the first query to actually
+    hit such a bucket — it must tolerate a missing one.
+    """
+    if not site_ids:
+        return {}
+
+    offline = {sid: {'logger_online': False, 'logger_last_seen': None} for sid in site_ids}
+
+    site_filter = ' or '.join([f'r.site == "{s}"' for s in site_ids])
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -3h)
+            |> filter(fn: (r) => r._measurement == "device_info")
+            |> filter(fn: (r) => r.device == "data_logger")
+            |> filter(fn: (r) => r._field == "heartbeat")
+            |> filter(fn: (r) => {site_filter})
+            |> last()
+    '''
+
+    try:
+        tables = query_api.query(flux, org=INFLUX_ORG)
+    except Exception:
+        return offline
+
+    last_by_site = {}
+    for table in tables:
+        for record in table.records:
+            sid = record.values.get('site')
+            t   = record.get_time()
+            if sid not in last_by_site or (t and t > last_by_site[sid]):
+                last_by_site[sid] = t
+
+    results = {}
+    for sid in site_ids:
+        t = last_by_site.get(sid)
+        results[sid] = {
+            'logger_online':    _is_fresh(t),
+            'logger_last_seen': t.isoformat() if t else None,
+        }
+    return results
+
+
 def get_portfolio_overview(bucket_groups, include_energy=True):
     """
     Fires 2 Flux queries per bucket (live snapshot + energy today), or 1 per
@@ -2335,6 +2426,8 @@ def get_portfolio_overview(bucket_groups, include_energy=True):
                 if include_energy else {}
             )
 
+            logger = _query_portfolio_logger(query_api, bucket, site_ids)
+
             for influx_site_id, site_pk in group['pk_map'].items():
                 results[site_pk] = {
                     **live.get(influx_site_id, {
@@ -2347,6 +2440,7 @@ def get_portfolio_overview(bucket_groups, include_energy=True):
                     'energy_today_kwh': (
                         energy.get(influx_site_id, 0.0) if include_energy else None
                     ),
+                    **logger.get(influx_site_id, {'logger_online': False, 'logger_last_seen': None}),
                 }
 
     finally:
