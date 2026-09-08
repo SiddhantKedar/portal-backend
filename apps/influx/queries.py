@@ -1063,7 +1063,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             fields    = inv_data.get(device_id, {})
             last_flds = inv_last.get(device_id, {})
             t         = inv_times.get(device_id)
-            is_online = bool(fields)
+            is_online = 'ac_active_power_kw' in fields
 
             # Device state (orthogonal to online/offline): last-known status from
             # the wider window, surfaced ONLY when the inverter is online — a flaky
@@ -1464,7 +1464,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             fields    = device_data.get(device_id, {})
             last_fields = device_last.get(device_id, {})
             t         = device_times.get(device_id)
-            is_online = bool(fields)
+            is_online = 'ac_active_power_kw' in fields
 
             inverter_status = None
             if is_online:
@@ -2285,7 +2285,7 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
                   'warning': 0, 'fault': 0, 'other': 0}
         for inv_id in inv_ids:
             inv_rec = raw.get((influx_site_id, inv_id))
-            if not inv_rec:
+            if not inv_rec or 'ac_active_power_kw' not in inv_rec:
                 continue
             online += 1
             # online-gated last-known status from the wider window
