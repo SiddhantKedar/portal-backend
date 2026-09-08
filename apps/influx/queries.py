@@ -20,6 +20,9 @@ MIN_POA_KWH_M2_FOR_PR = 0.3
 # Determine when to show device is offline
 STALE_AFTER_SECONDS = 120
 
+# STALE_AFTER_SECONDS, tighter than TIMELINE_GAP_SECONDS (300, faults timeline).
+INVERTER_STATUS_LOOKBACK_SECONDS = 180
+
 # For Generation start stop
 GENERATION_STOP_GAP_SECONDS = 120
 
@@ -77,6 +80,20 @@ def _is_fresh(record_time):
         return False
     age = (datetime.now(timezone.utc) - record_time).total_seconds()
     return age <= STALE_AFTER_SECONDS
+
+
+def _is_status_recent(record_time):
+    """
+    True if an inverter_status point is within the (wider) status lookback
+    window. Used to keep a flaky inverter's last-known state instead of nulling
+    it when it skips a status cycle. Callers must still confirm the inverter is
+    online before trusting it — offline always wins (no stuck last state).
+    """
+    if record_time is None:
+        return False
+    age = (datetime.now(timezone.utc) - record_time).total_seconds()
+    return age <= INVERTER_STATUS_LOOKBACK_SECONDS
+
 
 def _last_fresh_value(results, field):
     """
@@ -704,6 +721,7 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
     tables       = query_api.query(flux, org=INFLUX_ORG)
     device_data  = {}
     device_last  = {}
+    device_status = {}
     device_times = {}
 
     for table in tables:
@@ -717,6 +735,11 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
             if field == 'energy_total_kwh':
                 device_last.setdefault(device, {})[field] = value
 
+            if field == 'inverter_status':
+                if _is_status_recent(time):
+                    device_status[device] = (value, time)
+                continue
+
             # Instantaneous fields: fresh only.
             if not _is_fresh(time):
                 continue
@@ -728,7 +751,7 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
             if device not in device_times or time > device_times[device]:
                 device_times[device] = time
 
-    return device_data, device_last, device_times
+    return device_data, device_last, device_status, device_times
 
 
 def _query_plant_power_trend(query_api, bucket, site_id, meter_id, start, end, interval_minutes):
@@ -973,7 +996,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         meter_live, meter_time, meter_last = _query_meter_live(query_api, bucket, site_id, meter_id)
         meter_is_live = bool(meter_live)
         energy_today    = _query_meter_today_energy(query_api, bucket, site_id, meter_id)
-        inv_data, inv_last, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
+        inv_data, inv_last, inv_status, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
         inv_today_by_device = _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids)
 
         weather_fields = {}
@@ -1042,15 +1065,16 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             t         = inv_times.get(device_id)
             is_online = bool(fields)
 
-            # Device-reported state, live-only: present only when a FRESH
-            # inverter_status was captured (fields is already fresh-gated).
-            # Offline or not-emitted → None. Orthogonal to online/offline.
-            raw_status = fields.get('inverter_status')
-            if raw_status is not None:
-                code = int(round(raw_status))
-                inverter_status = {'code': code, 'label': _inverter_status_label(code)}
-            else:
-                inverter_status = None
+            # Device state (orthogonal to online/offline): last-known status from
+            # the wider window, surfaced ONLY when the inverter is online — a flaky
+            # inverter that skipped a status cycle keeps its state; an offline one
+            # reports None (offline wins).
+            inverter_status = None
+            if is_online:
+                status_rec = inv_status.get(device_id)
+                if status_rec is not None:
+                    code = int(round(status_rec[0]))
+                    inverter_status = {'code': code, 'label': _inverter_status_label(code)}
 
             if is_online:
                 online_count += 1
@@ -1390,6 +1414,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
         # last-known pattern as the meter).
         device_data  = {}
         device_last  = {}
+        device_status = {}
         device_times = {}
 
         for table in tables:
@@ -1403,6 +1428,12 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
                 # — that's the last-known counter value; keep it regardless of age.
                 if field == 'energy_total_kwh':
                     device_last.setdefault(device, {})[field] = value
+
+                # inverter_status: wider window, kept out of device_data (see plant overview).
+                if field == 'inverter_status':
+                    if _is_status_recent(time):
+                        device_status[device] = (value, time)
+                    continue
 
                 if not _is_fresh(time):
                     continue
@@ -1435,15 +1466,12 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             t         = device_times.get(device_id)
             is_online = bool(fields)
 
-            # Device-reported state, live-only (fields is fresh-gated). Offline
-            # or not-emitted → None. Orthogonal to online/offline — same axis
-            # split as plant overview.
-            raw_status = fields.get('inverter_status')
-            if raw_status is not None:
-                code = int(round(raw_status))
-                inverter_status = {'code': code, 'label': _inverter_status_label(code)}
-            else:
-                inverter_status = None
+            inverter_status = None
+            if is_online:
+                status_rec = device_status.get(device_id)
+                if status_rec is not None:
+                    code = int(round(status_rec[0]))
+                    inverter_status = {'code': code, 'label': _inverter_status_label(code)}
 
             if is_online:
                 online_count += 1
@@ -2219,16 +2247,25 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
 
     tables = query_api.query(flux, org=INFLUX_ORG)
 
-    raw = {}  # { (site_tag, device_tag): { field: value, _time: time } }
+    raw = {}         # { (site, device): { field: value, _time } } — fresh (120s), drives online
+    status_raw = {}  # { (site, device): status_value } — wider window, online-gated below
     for table in tables:
         for record in table.records:
-            if not _is_fresh(record.get_time()):
+            key   = (record.values.get('site'), record.values.get('device'))
+            field = record.get_field()
+            time  = record.get_time()
+
+            if field == 'inverter_status':
+                if _is_status_recent(time):
+                    status_raw[key] = record.get_value()
                 continue
-            key = (record.values.get('site'), record.values.get('device'))
+
+            if not _is_fresh(time):
+                continue
             if key not in raw:
                 raw[key] = {}
-            raw[key][record.get_field()] = record.get_value()
-            raw[key]['_time'] = record.get_time()
+            raw[key][field] = record.get_value()
+            raw[key]['_time'] = time
 
     results = {}
     for influx_site_id in site_ids:
@@ -2251,7 +2288,8 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
             if not inv_rec:
                 continue
             online += 1
-            raw_status = inv_rec.get('inverter_status')
+            # online-gated last-known status from the wider window
+            raw_status = status_raw.get((influx_site_id, inv_id))
             code = int(round(raw_status)) if raw_status is not None else None
             states[_INVERTER_STATE_KEYS.get(code, 'other')] += 1
 
@@ -3076,7 +3114,7 @@ def get_inverter_faults(bucket, site_id, inverter_ids, date_str=None):
             current = None
             if is_today and samples:
                 last_t, last_v = samples[-1]
-                if _is_fresh(last_t):
+                if _is_status_recent(last_t):          # was _is_fresh(last_t)
                     code = int(round(last_v))
                     current = {'code': code, 'label': _inverter_status_label(code)}
 
