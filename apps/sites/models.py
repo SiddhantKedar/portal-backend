@@ -15,7 +15,7 @@ class Customer(models.Model):
     email       = models.EmailField(unique=True)
     phone       = models.CharField(max_length=20, blank=True)
     address     = models.TextField(blank=True)
-    influx_bucket    = models.CharField(max_length=100, unique=True, null=True, blank=True)
+    influx_bucket    = models.CharField(max_length=100, null=True, blank=True)
     influx_client_id = models.CharField(max_length=100, null=True, blank=True)
     is_active   = models.BooleanField(default=True)
     created_at  = models.DateTimeField(auto_now_add=True)
