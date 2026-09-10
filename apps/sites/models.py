@@ -121,6 +121,7 @@ class Device(models.Model):
         DIDO            = 'DIDO',           'DIDO'
         WEATHER_STATION = 'WEATHER_STATION','Weather Station'
         TRANSFORMER     = 'TRANSFORMER',     'Transformer'
+        ANNUNCIATOR     = 'ANNUNCIATOR',     'Annunciator'
         OTHER           = 'OTHER',          'Other'
 
     site            = models.ForeignKey(

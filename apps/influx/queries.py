@@ -3137,3 +3137,175 @@ def get_inverter_faults(bucket, site_id, inverter_ids, date_str=None):
     except Exception as e:
         client.close()
         raise Exception(f'Inverter faults query failed: {str(e)}')
+
+
+# ── Annunciator (transformer protection alarms) ─────────────────────────────
+# Digital 0/1 channels off the annunciator device. Any point at 1 = active alarm.
+# Order here is the display order; alarm/trip pairs grouped, spares last. Labels
+# are a starting proposal — edit freely, the field keys are what must match Influx.
+ANNUNCIATOR_ALARM_FIELDS = [
+    ('bucholz_alarm', 'Buchholz Alarm'),
+    ('bucholz_trip',  'Buchholz Trip'),
+    ('oti_alarm',     'Oil Temp (OTI) Alarm'),
+    ('oti_trip',      'Oil Temp (OTI) Trip'),
+    ('wti_alarm',     'Winding Temp (WTI) Alarm'),
+    ('wti_trip',      'Winding Temp (WTI) Trip'),
+    ('mog_trip',      'Magnetic Oil Gauge (MOG) Trip'),
+    ('osr_trip',      'Oil Surge Relay (OSR) Trip'),
+    ('ef_trip',       'Earth Fault Trip'),
+    ('oc_trip',       'Over Current Trip'),
+    ('ov_trip',       'Over Voltage Trip'),
+    ('uv_trip',       'Under Voltage Trip'),
+    ('spare',         'Spare'),
+    ('spare1',        'Spare 1'),
+    ('spare2',        'Spare 2'),
+    ('spare3',        'Spare 3'),
+]
+
+# A run of 1s is one alarm event. Interior data gaps up to this are tolerated
+# (a dropped 60s sample won't split a continuous alarm); a longer gap means the
+# feed stopped, so we close the event at the last point we actually saw it at 1.
+ANNUNCIATOR_GAP_SECONDS = 180
+
+
+def _query_annunciator_series(query_api, bucket, site_id, device_ids, start_str, end_str):
+    """
+    Raw annunciator alarm points for the given device(s) over [start, end],
+    grouped by device then field, ascending. Every configured alarm channel is
+    pulled (0/1). Returns { device_id: { field: [(time, value_float), ...] } }.
+    """
+    device_filter = ' or '.join([f'r.device == "{d}"' for d in device_ids])
+    field_filter  = ' or '.join([f'r._field == "{f}"' for f, _ in ANNUNCIATOR_ALARM_FIELDS])
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start_str}, stop: {end_str})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => {field_filter})
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> sort(columns: ["_time"])
+    '''
+    out = {}
+    for table in query_api.query(flux, org=INFLUX_ORG):
+        for record in table.records:
+            device = record.values.get('device')
+            field  = record.get_field()
+            value  = record.get_value()
+            time   = record.get_time()
+            if device is None or field is None or value is None or time is None:
+                continue
+            out.setdefault(device, {}).setdefault(field, []).append((time, value))
+    for dev in out:
+        for f in out[dev]:
+            out[dev][f].sort(key=lambda p: p[0])
+    return out
+
+
+def _build_annunciator_events(samples, is_today, gap_seconds=ANNUNCIATOR_GAP_SECONDS):
+    """
+    samples: [(time, value_float), ...] ascending for ONE (device, field).
+    Returns every activation (run of value==1) as an event — no minimum duration.
+    A run is broken by a 0 reading, or by a data gap > gap_seconds (we never claim
+    an alarm spanned time we saw no data for). See dating conventions in the
+    endpoint docstring.
+    """
+    gap = timedelta(seconds=gap_seconds)
+    events = []
+    open_start  = None    # start of the currently open alarm run
+    last_active = None     # last sample seen at 1 within the open run
+    prev_t      = None
+
+    def close(start, end):
+        events.append({
+            'start': start.isoformat(),
+            'end':   end.isoformat(),
+            'duration_seconds': int((end - start).total_seconds()),
+            'ongoing': False,
+        })
+
+    for t, v in samples:
+        active = int(round(v)) == 1
+
+        # Feed stopped mid-alarm → close at the last point we saw it at 1.
+        if open_start is not None and prev_t is not None and (t - prev_t) > gap:
+            close(open_start, last_active)
+            open_start = None
+
+        if active:
+            if open_start is None:
+                open_start = t
+            last_active = t
+        elif open_start is not None:
+            close(open_start, t)          # end at the clearing 0-sample
+            open_start = None
+        prev_t = t
+
+    # Alarm still open at the end of the series.
+    if open_start is not None:
+        if is_today and _is_fresh(last_active):
+            events.append({
+                'start': open_start.isoformat(),
+                'end':   None,
+                'duration_seconds': int((datetime.now(timezone.utc) - open_start).total_seconds()),
+                'ongoing': True,
+            })
+        else:
+            close(open_start, last_active)  # feed stopped → cleared at last seen
+    return events
+
+
+def get_annunciator_history(bucket, site_id, device_ids, date_str=None):
+    """
+    Per-annunciator alarm event log for one site, one IST day. Every activation
+    of every channel is documented — no sub-5-min filtering (that's the inverter
+    timeline's rule, deliberately not applied here).
+
+    channels — full ordered field set (incl. spares), so the UI shows every point
+               even on a clean day with no events.
+    events   — per device, each channel's runs of 1, merged chronologically.
+
+    Dating: start = first 1-sample; end = clearing 0-sample, or last-seen 1 when
+    the feed stopped; ongoing = still 1 on a live today feed (end null).
+    """
+    start_utc, end_utc, is_today, date_iso = _ist_day_window(date_str)
+    start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str   = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    try:
+        series_by_device = _query_annunciator_series(
+            query_api, bucket, site_id, device_ids, start_str, end_str
+        )
+        client.close()
+
+        label_of = dict(ANNUNCIATOR_ALARM_FIELDS)
+        channels = [{'field': f, 'label': lbl} for f, lbl in ANNUNCIATOR_ALARM_FIELDS]
+
+        annunciators = []
+        for device_id in device_ids:
+            per_field = series_by_device.get(device_id, {})
+            events = []
+            for field, _lbl in ANNUNCIATOR_ALARM_FIELDS:
+                for ev in _build_annunciator_events(per_field.get(field, []), is_today):
+                    events.append({'field': field, 'label': label_of[field], **ev})
+            events.sort(key=lambda e: e['start'])
+            annunciators.append({
+                'device_id':   device_id,
+                'events':      events,
+                'event_count': len(events),
+            })
+
+        return {
+            'date':     date_iso,
+            'is_today': is_today,
+            'window':   {'start': start_utc.isoformat(), 'end': end_utc.isoformat()},
+            'gap_threshold_seconds': ANNUNCIATOR_GAP_SECONDS,
+            'channels': channels,
+            'annunciators': annunciators,
+        }
+    except Exception as e:
+        client.close()
+        raise e
