@@ -70,4 +70,13 @@ ANALYTICS_METRICS = {
         'label': 'Module Temperature', 'unit': '\u00b0C',
         'fields': {'WEATHER_STATION': 'module_temp_c'},
     },
+
+    'transformer_oil_temp': {
+        'label': 'Transformer Oil Temp', 'unit': '\u00b0C',
+        'fields': {'TRANSFORMER': 'transformer_oil_temp_c'},
+    },
+    'transformer_winding_temp': {
+        'label': 'Transformer Winding Temp', 'unit': '\u00b0C',
+        'fields': {'TRANSFORMER': 'transformer_winding_temp_c'},
+    },
 }
