@@ -189,9 +189,7 @@ class Command(BaseCommand):
         bucket = site.customer.influx_bucket
         site_id = site.influx_site_id
 
-        meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
-        ).first()
+        meter = site.get_reference_meter()
         if not meter:
             return None, None, None
 

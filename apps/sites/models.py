@@ -63,6 +63,21 @@ class Site(models.Model):
         on_delete=models.SET_NULL,
         related_name='related_sites'
     )
+
+    reference_meter = models.ForeignKey(
+        'Device', null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='referenced_by_sites',
+        limit_choices_to={'device_type': 'METER'},
+        help_text=(
+            "Meter whose history drives this plant's power/energy figures "
+            "(active power, energy today, etotal). Defaults to the site's own "
+            "active 'meter1' when unset. May live on a parent/substation site "
+            "for a plant with a damaged local meter. If the chosen meter is "
+            "deactivated, this plant reports no reference meter until a new one "
+            "is set."
+        )
+    )
     location    = models.CharField(max_length=255, blank=True)
     latitude    = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     longitude   = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
@@ -103,6 +118,78 @@ class Site(models.Model):
             name='unique_substation_per_parent_site'
         ),
         ]
+
+    def get_reference_meter(self):
+        """
+        The meter whose history drives etoday / etotal / active-power for this
+        plant. Bulk equivalent: Site.reference_meters_for() — keep the two in
+        lockstep.
+
+        - Explicit reference_meter wins, but ONLY while active. A deactivated
+          chosen meter returns None (no silent fall back to meter1) so the dead
+          meter is visibly unconfigured rather than masked.
+        - No FK -> legacy active 'meter1' on this site.
+        """
+        if self.reference_meter_id:
+            m = self.reference_meter
+            return m if m.is_active else None
+        return Device.objects.filter(
+            site=self, device_type=Device.DeviceType.METER,
+            is_active=True, influx_device_id='meter1'
+        ).first()
+
+    def get_grid_meter(self):
+        """
+        The HT grid-interface meter ('meter1') — source of grid electrical
+        values (voltage, current, frequency, power factor) and the grid
+        section's liveness. Distinct from get_reference_meter(): grid values
+        must come from the real HT meter even when generation figures are read
+        from a substituted reference meter. Returns None if meter1 is missing
+        or deactivated, so a dead HT meter surfaces rather than silently
+        zeroing the grid section.
+        """
+        return Device.objects.filter(
+            site=self, device_type=Device.DeviceType.METER,
+            is_active=True, influx_device_id='meter1'
+        ).first()
+
+    @staticmethod
+    def reference_meters_for(sites):
+        """
+        {site.pk: Device|None} for many sites in 2 queries, N-independent.
+        Bulk mirror of Site.get_reference_meter — MUST stay in lockstep,
+        including: an explicit but INACTIVE reference_meter yields None with no
+        fallback to meter1. Result is keyed on the REFERENCING site's pk, so a
+        meter borrowed from a substation is filed under the plant, not the
+        substation.
+        """
+        result = {}
+        ref_ids = {}        # site.pk -> chosen device pk (FK set)
+        fallback_pks = []   # sites with no FK -> legacy meter1
+
+        for s in sites:
+            if s.reference_meter_id:
+                ref_ids[s.pk] = s.reference_meter_id
+            else:
+                fallback_pks.append(s.pk)
+
+        if ref_ids:
+            # in_bulk fetches by pk regardless of is_active — re-check in Python.
+            devs = Device.objects.in_bulk(set(ref_ids.values()))
+            for pk, dev_id in ref_ids.items():
+                m = devs.get(dev_id)
+                result[pk] = m if (m and m.is_active) else None
+
+        if fallback_pks:
+            legacy = Device.objects.filter(
+                site_id__in=fallback_pks, device_type=Device.DeviceType.METER,
+                is_active=True, influx_device_id='meter1'
+            )
+            legacy_by_site = {m.site_id: m for m in legacy}
+            for pk in fallback_pks:
+                result[pk] = legacy_by_site.get(pk)
+
+        return result
 
     def __str__(self):
         return f'{self.name} - {self.customer.name}'
