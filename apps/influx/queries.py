@@ -958,7 +958,7 @@ def _resolve_ist_date_range(date_str):
     return start_str, end_str
 
 
-def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None, transformer_device_id=None, target_cuf_pct=None,  grid_meter_id=None):
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None, transformer_device_id=None, target_cuf_pct=None,  grid_meter_id=None, meter_site_id=None, grid_site_id=None):
     """
     Plant overview — single function, four or five internal queries.
     Returns everything for the plant overview page stat cards,
@@ -994,20 +994,27 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
     query_api = client.query_api()
 
     try:
-         # meter_id = reference meter (generation: active power, energy, etotal).
-        # grid_meter_id = HT meter1 (grid electrical: V/I/freq/PF + status).
-        # When unset or identical, one live query serves both — no extra cost.
+        # site_id = the PLANT (inverters, weather, transformer, logger all live
+        # here). The reference and grid meters may live on a SUBSTATION whose
+        # site tag differs — meter1 is not unique across sites, so each meter
+        # carries its own site tag. Default both to the plant when unset.
+        if meter_site_id is None:
+            meter_site_id = site_id
         if grid_meter_id is None:
             grid_meter_id = meter_id
+            grid_site_id  = meter_site_id
+        if grid_site_id is None:
+            grid_site_id = site_id
 
-        ref_live, ref_time, ref_last = _query_meter_live(query_api, bucket, site_id, meter_id)
-        if grid_meter_id == meter_id:
+        ref_live, ref_time, ref_last = _query_meter_live(query_api, bucket, meter_site_id, meter_id)
+        if grid_meter_id == meter_id and grid_site_id == meter_site_id:
             grid_live, grid_time = ref_live, ref_time
         else:
-            grid_live, grid_time, _grid_last = _query_meter_live(query_api, bucket, site_id, grid_meter_id)
+            grid_live, grid_time, _grid_last = _query_meter_live(query_api, bucket, grid_site_id, grid_meter_id)
+        meter_is_live = bool(grid_live)
 
         meter_is_live = bool(grid_live)          # grid meter liveness drives meter.status
-        energy_today  = _query_meter_today_energy(query_api, bucket, site_id, meter_id)
+        energy_today = _query_meter_today_energy(query_api, bucket, meter_site_id, meter_id)
         inv_data, inv_last, inv_status, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
         inv_today_by_device = _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids)
 
@@ -1058,7 +1065,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         if dido_device_id:
             breaker_fields = _query_breaker_live(query_api, bucket, site_id, dido_device_id)
 
-        generation_window = _query_plant_generation_window(query_api, bucket, site_id, meter_id)
+        generation_window = _query_plant_generation_window(query_api, bucket, meter_site_id, meter_id)
 
         logger_online, logger_time = _query_data_logger(query_api, bucket, site_id)
 
@@ -1226,7 +1233,7 @@ def _trend_stats(results, field):
     }
 
 
-def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, date_str=None, interval_minutes=5):
+def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, date_str=None, interval_minutes=5, meter_site_id=None):
     """
     Plant power trend for a selected date.
     date_str: 'YYYY-MM-DD' in IST. Defaults to today if not provided.
@@ -1241,12 +1248,18 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
     """
     start_str, end_str = _resolve_ist_date_range(date_str)
 
+    # site_id = plant (weather/irradiance lives here). The reference meter may
+    # be on a substation whose Influx site tag differs — meter1 is not unique
+    # across sites. Default to the plant when the caller doesn't override.
+    if meter_site_id is None:
+        meter_site_id = site_id
+
     client    = get_influx_client()
     query_api = client.query_api()
 
     try:
         power_rows = _query_plant_power_trend(
-            query_api, bucket, site_id, meter_id,
+            query_api, bucket, meter_site_id, meter_id,
             start_str, end_str, interval_minutes
         )
         power_map = {row['time']: row['active_power_total_kw'] for row in power_rows}
@@ -1254,8 +1267,8 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
         irradiance_map = {}
         if weather_device_id:
             irradiance_map = _query_irradiance_trend(
-                query_api, bucket, site_id, weather_device_id,
-                start_str, end_str, interval_minutes
+            query_api, bucket, site_id, weather_device_id,
+            start_str, end_str, interval_minutes
             )
 
         client.close()
@@ -2228,7 +2241,11 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
     if not site_ids:
         return {}
 
-    all_devices = set(site_meter_map.values())
+    all_devices = set()
+    meter_site_tags = set()
+    for meter_site, meter_dev in site_meter_map.values():
+        all_devices.add(meter_dev)
+        meter_site_tags.add(meter_site)
     for inv_ids in site_inverters_map.values():
         all_devices.update(inv_ids)
 
@@ -2238,7 +2255,8 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
         return {sid: {**empty, 'inverters_total': len(site_inverters_map.get(sid, []))}
                 for sid in site_ids}
 
-    site_filter   = ' or '.join([f'r.site == "{s}"' for s in site_ids])
+    filter_sites = set(site_ids) | meter_site_tags
+    site_filter   = ' or '.join([f'r.site == "{s}"' for s in filter_sites])
     device_filter = ' or '.join([f'r.device == "{d}"' for d in all_devices])
 
     flux = f'''
@@ -2280,9 +2298,13 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
 
     results = {}
     for influx_site_id in site_ids:
-        meter_id  = site_meter_map.get(influx_site_id)
-        inv_ids   = site_inverters_map.get(influx_site_id, [])
-        meter_rec = raw.get((influx_site_id, meter_id), {}) if meter_id else {}
+        meter_entry = site_meter_map.get(influx_site_id)      # (meter_site, device) or None
+        inv_ids     = site_inverters_map.get(influx_site_id, [])
+        if meter_entry:
+            meter_site, meter_id = meter_entry
+            meter_rec = raw.get((meter_site, meter_id), {})   # meter's OWN site tag
+        else:
+            meter_rec = {}
         last_time = meter_rec.get('_time')
 
         raw_power = meter_rec.get('active_power_total_kw', 0.0)
@@ -2325,9 +2347,14 @@ def _query_portfolio_energy_today(query_api, bucket, site_meter_map):
     if not site_meter_map:
         return {}
 
-    site_ids      = list(site_meter_map.keys())
-    site_filter   = ' or '.join([f'r.site == "{s}"' for s in site_ids])
-    meter_ids     = list(set(site_meter_map.values()))
+    site_ids   = list(site_meter_map.keys())
+    meter_ids  = list({dev for (_site, dev) in site_meter_map.values()})
+    meter_tags = {site for (site, _dev) in site_meter_map.values()}
+
+    # Include meter site tags (substation meters live under their own tag) so
+    # their series are in range. Same-bucket is guaranteed by the caller.
+    filter_sites  = set(site_ids) | meter_tags
+    site_filter   = ' or '.join([f'r.site == "{s}"' for s in filter_sites])
     device_filter = ' or '.join([f'r.device == "{d}"' for d in meter_ids])
     start         = get_ist_midnight_utc()
     ist_offset    = '5h30m'
@@ -2374,7 +2401,7 @@ def _query_portfolio_energy_today(query_api, bucket, site_meter_map):
             energy_map[key] = abs(round(record.get_value(), 2))
 
     return {
-        influx_site_id: energy_map.get((influx_site_id, site_meter_map[influx_site_id]), 0.0)
+        influx_site_id: energy_map.get(site_meter_map[influx_site_id], 0.0)
         for influx_site_id in site_ids
     }
 

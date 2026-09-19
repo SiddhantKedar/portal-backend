@@ -69,15 +69,18 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
 
         site_pks = [s.pk for s in sites]
 
-        # Reference meter per site (FK override, else legacy meter1; substation
-        # meters filed under the referencing plant, not their own site). 2 queries.
         ref_meters = Site.reference_meters_for(sites)
         inverters = Device.objects.filter(
             site_id__in=site_pks, device_type='INVERTER', is_active=True
         )
 
-        # Lookup maps keyed on site PK — never influx_site_id (see D20).
-        meter_by_pk = {pk: m.influx_device_id for pk, m in ref_meters.items() if m}
+        # {plant_pk: (meter_site_tag, meter_device_id)} — the meter's OWN site
+        # tag, which differs from the plant's when the reference meter lives on a
+        # substation. meter1 is not unique across sites, so both tags travel.
+        meter_by_pk = {
+            pk: m.influx_location            # (site_influx_id, device_id)
+            for pk, m in ref_meters.items() if m
+        }
         inverters_by_pk = {}
         for inv in inverters:
             inverters_by_pk.setdefault(inv.site_id, []).append(inv.influx_device_id)
@@ -94,7 +97,7 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
             iid = site.influx_site_id
             group['pk_map'][iid] = site.pk
             if site.pk in meter_by_pk:
-                group['meter_map'][iid] = meter_by_pk[site.pk]
+                group['meter_map'][iid] = meter_by_pk[site.pk]   # now a (tag, device) pair
             group['inverters_map'][iid] = inverters_by_pk.get(site.pk, [])
 
         try:

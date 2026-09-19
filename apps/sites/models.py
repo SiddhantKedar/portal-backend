@@ -119,36 +119,19 @@ class Site(models.Model):
         ),
         ]
 
-    def get_reference_meter(self):
-        """
-        The meter whose history drives etoday / etotal / active-power for this
-        plant. Bulk equivalent: Site.reference_meters_for() — keep the two in
-        lockstep.
+    
 
-        - Explicit reference_meter wins, but ONLY while active. A deactivated
-          chosen meter returns None (no silent fall back to meter1) so the dead
-          meter is visibly unconfigured rather than masked.
-        - No FK -> legacy active 'meter1' on this site.
-        """
+    def get_reference_meter(self):
         if self.reference_meter_id:
-            m = self.reference_meter
+            m = self.reference_meter          # FK; .site is one extra query when accessed
             return m if m.is_active else None
-        return Device.objects.filter(
+        return Device.objects.select_related('site').filter(
             site=self, device_type=Device.DeviceType.METER,
             is_active=True, influx_device_id='meter1'
         ).first()
 
     def get_grid_meter(self):
-        """
-        The HT grid-interface meter ('meter1') — source of grid electrical
-        values (voltage, current, frequency, power factor) and the grid
-        section's liveness. Distinct from get_reference_meter(): grid values
-        must come from the real HT meter even when generation figures are read
-        from a substituted reference meter. Returns None if meter1 is missing
-        or deactivated, so a dead HT meter surfaces rather than silently
-        zeroing the grid section.
-        """
-        return Device.objects.filter(
+        return Device.objects.select_related('site').filter(
             site=self, device_type=Device.DeviceType.METER,
             is_active=True, influx_device_id='meter1'
         ).first()
@@ -190,6 +173,7 @@ class Site(models.Model):
                 result[pk] = legacy_by_site.get(pk)
 
         return result
+
 
     def __str__(self):
         return f'{self.name} - {self.customer.name}'
@@ -236,6 +220,19 @@ class Device(models.Model):
                 name='unique_device_id_per_site'
             )
         ]
+
+    @property
+    def influx_location(self):
+        """
+        (site_tag, device_tag) for this device's own InfluxDB series.
+
+        The site tag is the DEVICE's own site, not whichever plant references
+        it — critical because influx_device_id is NOT unique across sites
+        (every site's main meter is 'meter1'). A meter is located in Influx by
+        site tag + device tag together; separating them reads a different site's
+        same-named meter. Always pass this pair, never the device id alone.
+        """
+        return self.site.influx_site_id, self.influx_device_id
 
     def __str__(self):
         return f'{self.name} ({self.device_type}) - {self.site.name}'

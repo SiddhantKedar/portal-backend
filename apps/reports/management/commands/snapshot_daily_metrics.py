@@ -145,6 +145,8 @@ class Command(BaseCommand):
         meter = site.get_reference_meter()
         if not meter:
             raise SkipSite('No reference meter configured for this site')
+
+        meter_site_tag, meter_dev = meter.influx_location
         
         inverters = list(Device.objects.filter(
             site=site, device_type='INVERTER', is_active=True
@@ -163,28 +165,28 @@ class Command(BaseCommand):
 
         try:
             energy_kwh, meter_status, meter_open_kwh, meter_close_kwh = _query_meter_energy_for_day(
-                query_api, bucket, site_id, meter.influx_device_id, start, end
+                query_api, bucket, meter_site_tag, meter_dev, start, end
             )
 
             inv_sum_kwh, inv_reporting_count = (None, None)
             if inverter_ids:
                 inv_sum_kwh, inv_reporting_count = _query_inverter_daily_sum_for_day(
-                    query_api, bucket, site_id, inverter_ids, start, end
+                    query_api, bucket, site_id, inverter_ids, start, end   # plant — inverters
                 )
 
             poa_kwh_m2 = None
             if weather_device:
                 poa_wh_m2 = _query_poa_irradiation_for_day(
-                    query_api, bucket, site_id, weather_device.influx_device_id, start, end
+                    query_api, bucket, site_id, weather_device.influx_device_id, start, end  # plant — weather
                 )
                 poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
 
             peak_power_kw, peak_power_time = _query_meter_peak_power_for_day(
-                query_api, bucket, site_id, meter.influx_device_id, start, end
+                query_api, bucket, meter_site_tag, meter_dev, start, end
             )
 
             gen_start_time, gen_end_time = _query_generation_window_for_day(
-                query_api, bucket, site_id, meter.influx_device_id, start, end
+                query_api, bucket, meter_site_tag, meter_dev, start, end
             )
         finally:
             client.close()

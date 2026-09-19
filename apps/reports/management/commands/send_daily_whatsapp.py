@@ -193,23 +193,25 @@ class Command(BaseCommand):
         if not meter:
             return None, None, None
 
+        meter_site_tag, meter_dev = meter.influx_location
+
         weather_device = Device.objects.filter(
             site=site, device_type='WEATHER_STATION', is_active=True
         ).first()
 
         energy_kwh, _meter_status, _meter_open, _meter_close = _query_meter_energy_for_day(
-            query_api, bucket, site_id, meter.influx_device_id, start, end
+            query_api, bucket, meter_site_tag, meter_dev, start, end
         )
 
         meter_data, _meter_time, _meter_last = _query_meter_live(
-            query_api, bucket, site_id, meter.influx_device_id
+            query_api, bucket, meter_site_tag, meter_dev
         )
         meter_is_live = bool(meter_data)
 
         poa_kwh_m2 = None
         if weather_device:
             poa_wh_m2 = _query_poa_irradiation_for_day(
-                query_api, bucket, site_id, weather_device.influx_device_id, start, end
+                query_api, bucket, site_id, weather_device.influx_device_id, start, end  # plant — weather
             )
             poa_kwh_m2 = round(poa_wh_m2 / 1000.0, 4)
 
