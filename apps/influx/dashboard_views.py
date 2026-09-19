@@ -87,18 +87,16 @@ class DailyEnergyView(TenantFilterMixin, APIView):
 
         meter = site.get_reference_meter()
         if not meter:
-            return Response(
-                {'detail': 'No reference meter found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
+            return Response({'detail': 'No reference meter found'},
+                            status=status.HTTP_404_NOT_FOUND)
+        meter_site_tag, meter_dev = meter.influx_location
         bucket = site.customer.influx_bucket
 
         try:
             data = get_daily_energy(
                 bucket   = bucket,
-                site_id  = site.influx_site_id,
-                meter_id = meter.influx_device_id,
+                site_id  = meter_site_tag,
+                meter_id = meter_dev,
                 days     = days,
             )
             return Response({
@@ -150,13 +148,12 @@ class PlantOverviewView(TenantFilterMixin, APIView):
 
         ref_meter = site.get_reference_meter()
         if not ref_meter:
-            return Response(
-                {'detail': 'No reference meter found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
+            return Response({'detail': 'No reference meter found'},
+                            status=status.HTTP_404_NOT_FOUND)
         grid_meter = site.get_grid_meter()
 
+        ref_site_tag,  ref_dev  = ref_meter.influx_location
+        grid_site_tag, grid_dev = grid_meter.influx_location if grid_meter else (None, None)
         name_map     = {d.influx_device_id: d.name for d in inverters}
         inverter_ids = list(name_map.keys())
         bucket       = site.customer.influx_bucket
@@ -181,7 +178,11 @@ class PlantOverviewView(TenantFilterMixin, APIView):
                 bucket       = bucket,
                 site_id      = site.influx_site_id,
                 inverter_ids = inverter_ids,
-                meter_id     = ref_meter.influx_device_id,
+                meter_id      = ref_dev,
+                meter_site_id = ref_site_tag,
+                grid_meter_id = grid_dev,        # None if no HT meter → defaults to reference inside
+                grid_site_id  = grid_site_tag,
+                meter_energy_offset_kwh = float(ref_meter.energy_offset_kwh),
                 weather_device_id  = weather_device.influx_device_id if weather_device else None,
                 dido_device_id     = dido_device.influx_device_id if dido_device else None,
                 transformer_device_id = transformer_device.influx_device_id if transformer_device else None,
@@ -189,8 +190,6 @@ class PlantOverviewView(TenantFilterMixin, APIView):
                 ac_capacity_kw     = site.ac_capacity_kw,
                 daily_generation_target_kwh = site.daily_generation_target_kwh,
                 target_cuf_pct = site.target_cuf_pct,
-                meter_energy_offset_kwh = float(ref_meter.energy_offset_kwh),
-                grid_meter_id = grid_meter.influx_device_id if grid_meter else None,
             )
 
             # Attach human readable names
@@ -261,12 +260,11 @@ class PlantPowerTrendView(TenantFilterMixin, APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        meter = site.get_reference_meter()
+        meter = site.get_grid_meter()
         if not meter:
-            return Response(
-                {'detail': 'No reference meter found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({'detail': 'No grid meter found'},
+                            status=status.HTTP_404_NOT_FOUND)
+        meter_site_tag, meter_dev = meter.influx_location
         
         weather_device = Device.objects.filter(
             site=site, device_type='WEATHER_STATION', is_active=True
@@ -277,8 +275,9 @@ class PlantPowerTrendView(TenantFilterMixin, APIView):
         try:
             result = get_plant_power_trend(
                 bucket             = bucket,
-                site_id            = site.influx_site_id,
-                meter_id           = meter.influx_device_id,
+                site_id            = site.influx_site_id,   # plant — for weather overlay
+                meter_id           = meter_dev,
+                meter_site_id      = meter_site_tag,        # substation-aware meter tag
                 weather_device_id  = weather_device.influx_device_id if weather_device else None,
                 date_str           = date_str,
                 interval_minutes   = interval,
