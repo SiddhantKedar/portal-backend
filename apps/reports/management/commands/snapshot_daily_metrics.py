@@ -142,15 +142,14 @@ class Command(BaseCommand):
         bucket  = site.customer.influx_bucket
         site_id = site.influx_site_id
 
-        meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
-        ).first()
+        meter = site.get_reference_meter()
         if not meter:
-            raise SkipSite('No main meter configured for this site')
-
+            raise SkipSite('No reference meter configured for this site')
+        
         inverters = list(Device.objects.filter(
             site=site, device_type='INVERTER', is_active=True
         ))
+
         inverter_ids = [d.influx_device_id for d in inverters]
 
         weather_device = Device.objects.filter(

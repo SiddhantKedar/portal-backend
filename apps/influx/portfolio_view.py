@@ -69,16 +69,15 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
 
         site_pks = [s.pk for s in sites]
 
-        # 2 Postgres queries — all meters and inverters for these sites at once
-        meters = Device.objects.filter(
-            site_id__in=site_pks, device_type='METER', is_active=True, influx_device_id='meter1'
-        )
+        # Reference meter per site (FK override, else legacy meter1; substation
+        # meters filed under the referencing plant, not their own site). 2 queries.
+        ref_meters = Site.reference_meters_for(sites)
         inverters = Device.objects.filter(
             site_id__in=site_pks, device_type='INVERTER', is_active=True
         )
 
         # Lookup maps keyed on site PK — never influx_site_id (see D20).
-        meter_by_pk = {m.site_id: m.influx_device_id for m in meters}
+        meter_by_pk = {pk: m.influx_device_id for pk, m in ref_meters.items() if m}
         inverters_by_pk = {}
         for inv in inverters:
             inverters_by_pk.setdefault(inv.site_id, []).append(inv.influx_device_id)

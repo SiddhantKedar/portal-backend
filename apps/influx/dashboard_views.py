@@ -3,6 +3,7 @@
 #   1. /dashboard/overview/ — everything for the plant page, one call
 #   2. /dashboard/daily-energy/ — 7 day bar chart, called once on load
 
+from django.contrib.admin import site
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -84,12 +85,10 @@ class DailyEnergyView(TenantFilterMixin, APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
-        ).first()
+        meter = site.get_reference_meter()
         if not meter:
             return Response(
-                {'detail': 'No main meter found'},
+                {'detail': 'No reference meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 
@@ -149,14 +148,14 @@ class PlantOverviewView(TenantFilterMixin, APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
-        ).first()
-        if not meter:
+        ref_meter = site.get_reference_meter()
+        if not ref_meter:
             return Response(
-                {'detail': 'No main meter found'},
+                {'detail': 'No reference meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+
+        grid_meter = site.get_grid_meter()
 
         name_map     = {d.influx_device_id: d.name for d in inverters}
         inverter_ids = list(name_map.keys())
@@ -182,7 +181,7 @@ class PlantOverviewView(TenantFilterMixin, APIView):
                 bucket       = bucket,
                 site_id      = site.influx_site_id,
                 inverter_ids = inverter_ids,
-                meter_id     = meter.influx_device_id,
+                meter_id     = ref_meter.influx_device_id,
                 weather_device_id  = weather_device.influx_device_id if weather_device else None,
                 dido_device_id     = dido_device.influx_device_id if dido_device else None,
                 transformer_device_id = transformer_device.influx_device_id if transformer_device else None,
@@ -190,7 +189,8 @@ class PlantOverviewView(TenantFilterMixin, APIView):
                 ac_capacity_kw     = site.ac_capacity_kw,
                 daily_generation_target_kwh = site.daily_generation_target_kwh,
                 target_cuf_pct = site.target_cuf_pct,
-                meter_energy_offset_kwh = float(meter.energy_offset_kwh),
+                meter_energy_offset_kwh = float(ref_meter.energy_offset_kwh),
+                grid_meter_id = grid_meter.influx_device_id if grid_meter else None,
             )
 
             # Attach human readable names
@@ -261,12 +261,10 @@ class PlantPowerTrendView(TenantFilterMixin, APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
-        ).first()
+        meter = site.get_reference_meter()
         if not meter:
             return Response(
-                {'detail': 'No main meter found'},
+                {'detail': 'No reference meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
         
@@ -329,12 +327,10 @@ class PlantElectricalTrendView(TenantFilterMixin, APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        meter = Device.objects.filter(
-            site=site, device_type='METER', is_active=True, influx_device_id='meter1'
-        ).first()
+        meter = site.get_grid_meter()
         if not meter:
             return Response(
-                {'detail': 'No main meter found'},
+                {'detail': 'No grid meter found'},
                 status=status.HTTP_404_NOT_FOUND
             )
 

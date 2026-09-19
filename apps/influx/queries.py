@@ -958,7 +958,7 @@ def _resolve_ist_date_range(date_str):
     return start_str, end_str
 
 
-def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None, transformer_device_id=None, target_cuf_pct=None):
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None, transformer_device_id=None, target_cuf_pct=None,  grid_meter_id=None):
     """
     Plant overview — single function, four or five internal queries.
     Returns everything for the plant overview page stat cards,
@@ -994,10 +994,20 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
     query_api = client.query_api()
 
     try:
-        # Four or five internal queries, one client session
-        meter_live, meter_time, meter_last = _query_meter_live(query_api, bucket, site_id, meter_id)
-        meter_is_live = bool(meter_live)
-        energy_today    = _query_meter_today_energy(query_api, bucket, site_id, meter_id)
+         # meter_id = reference meter (generation: active power, energy, etotal).
+        # grid_meter_id = HT meter1 (grid electrical: V/I/freq/PF + status).
+        # When unset or identical, one live query serves both — no extra cost.
+        if grid_meter_id is None:
+            grid_meter_id = meter_id
+
+        ref_live, ref_time, ref_last = _query_meter_live(query_api, bucket, site_id, meter_id)
+        if grid_meter_id == meter_id:
+            grid_live, grid_time = ref_live, ref_time
+        else:
+            grid_live, grid_time, _grid_last = _query_meter_live(query_api, bucket, site_id, grid_meter_id)
+
+        meter_is_live = bool(grid_live)          # grid meter liveness drives meter.status
+        energy_today  = _query_meter_today_energy(query_api, bucket, site_id, meter_id)
         inv_data, inv_last, inv_status, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
         inv_today_by_device = _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids)
 
@@ -1108,14 +1118,14 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         # Plant Overview only: raw meter value is negative during export (normal
         # generation). We only want to show 0 when the meter is drawing power
         # (importing, i.e. raw value positive) rather than a negative number.
-        raw_active_power = meter_live.get('active_power_total_kw', 0.0)
+        raw_active_power = ref_live.get('active_power_total_kw', 0.0)
         if raw_active_power > 0:
             active_power_kw = 0.0
         else:
             active_power_kw = round(raw_active_power * -1, 2)
 
         performance_ratio_pct = None
-        if meter_is_live and dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR and weather_fields:
+        if bool(ref_live) and dc_capacity_kw and poa_kwh_m2 >= MIN_POA_KWH_M2_FOR_PR and weather_fields:
             performance_ratio_pct = round(
                 (energy_today / (float(dc_capacity_kw) * poa_kwh_m2)) * 100, 2
             )
@@ -1137,27 +1147,26 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
             'plant': {
                 'active_power_kw':  active_power_kw,
                 'energy_today_kwh': energy_today,
-                'frequency_hz':     round(meter_live.get('grid_frequency_hz', 0.0), 2),
-                'power_factor':     round(meter_live.get('power_factor_total', 0.0), 2),
-                'reactive_power_kvar': round(meter_live.get('reactive_power_total_kvar', 0.0), 2),
+                'frequency_hz':     round(grid_live.get('grid_frequency_hz', 0.0), 2),
+                'power_factor':     round(grid_live.get('power_factor_total', 0.0), 2),
+                'reactive_power_kvar': round(grid_live.get('reactive_power_total_kvar', 0.0), 2),
                 'dc_capacity_kw':   float(dc_capacity_kw) if dc_capacity_kw else None,
                 'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
                 'daily_generation_target_kwh': float(daily_generation_target_kwh) if daily_generation_target_kwh else None,
                 'target_cuf_pct': float(target_cuf_pct) if target_cuf_pct else None,
                 'energy_active_export_kwh': round(
-                    meter_last['energy_active_export_kwh'] + meter_energy_offset_kwh, 2
-                ) if 'energy_active_export_kwh' in meter_last else 0.0,
+                    ref_last['energy_active_export_kwh'] + meter_energy_offset_kwh, 2
+                ) if 'energy_active_export_kwh' in ref_last else 0.0,
             },
 
             'grid': {
-                'voltage_ab': round(meter_live.get('voltage_line_ab_v', 0.0), 3),
-                'voltage_bc': round(meter_live.get('voltage_line_bc_v', 0.0), 3),
-                'voltage_ca': round(meter_live.get('voltage_line_ca_v', 0.0), 3),
-                'current_a':  round(meter_live.get('current_phase_a', 0.0), 2),
-                'current_b':  round(meter_live.get('current_phase_b', 0.0), 2),
-                'current_c':  round(meter_live.get('current_phase_c', 0.0), 2),
+                'voltage_ab': round(grid_live.get('voltage_line_ab_v', 0.0), 3),
+                'voltage_bc': round(grid_live.get('voltage_line_bc_v', 0.0), 3),
+                'voltage_ca': round(grid_live.get('voltage_line_ca_v', 0.0), 3),
+                'current_a':  round(grid_live.get('current_phase_a', 0.0), 2),
+                'current_b':  round(grid_live.get('current_phase_b', 0.0), 2),
+                'current_c':  round(grid_live.get('current_phase_c', 0.0), 2),
             },
-
             'inverters': inverter_list,
 
             'device_summary': {
@@ -1169,7 +1178,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
 
             'meter': {
                 'status':       'online' if meter_is_live else 'offline',
-                'last_updated': meter_time.isoformat() if meter_time else None,
+                'last_updated': grid_time.isoformat() if grid_time else None,
             },
 
             'data_logger': {
