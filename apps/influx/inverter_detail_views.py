@@ -70,6 +70,9 @@ class InverterDetailView(TenantFilterMixin, APIView):
                 device_id                = device.influx_device_id,
                 weather_device_id        = weather_device_id,
                 dc_capacity_per_inverter = dc_capacity_per_inverter,
+                energy_today_register    = (
+                    device.energy_today_source == Device.EnergyTodaySource.REGISTER
+                ),
             )
             data['name'] = device.name
 

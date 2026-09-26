@@ -51,6 +51,10 @@ class InverterOverviewView(TenantFilterMixin, APIView):
 
         name_map     = {d.influx_device_id: d.name for d in inverters}
         inverter_ids = list(name_map.keys())
+        register_inverter_ids = [
+            d.influx_device_id for d in inverters
+            if d.energy_today_source == Device.EnergyTodaySource.REGISTER
+        ]
         bucket       = site.customer.influx_bucket
 
         weather_device = Device.objects.filter(
@@ -66,6 +70,7 @@ class InverterOverviewView(TenantFilterMixin, APIView):
                 weather_device_id = weather_device_id,
                 dc_capacity_kw    = site.dc_capacity_kw,
                 ac_capacity_kw    = site.ac_capacity_kw,
+                register_inverter_ids = register_inverter_ids,
             )
 
             # Attach human readable names

@@ -31,6 +31,11 @@ GENERATION_STOP_GAP_SECONDS = 120
 # Minimum active power to consider generating
 EXPORT_THRESHOLD_KW = -1.0
 
+# REGISTER-mode inverters: ignore energy_today_kw points in the first minutes
+# after IST midnight — the register resets ~00:01, and a point carrying
+# yesterday's final value must never be read as today's.
+INVERTER_TODAY_REGISTER_GRACE_SECONDS = 300
+
 
 # -------- Inverter status mapping ----------
 # Canonical inverter_status codes (single-value, per handoff spec):
@@ -958,7 +963,7 @@ def _resolve_ist_date_range(date_str):
     return start_str, end_str
 
 
-def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None, transformer_device_id=None, target_cuf_pct=None,  grid_meter_id=None, meter_site_id=None, grid_site_id=None):
+def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_id=None, dido_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, meter_energy_offset_kwh=0.0, daily_generation_target_kwh=None, transformer_device_id=None, target_cuf_pct=None,  grid_meter_id=None, meter_site_id=None, grid_site_id=None, register_inverter_ids=None):
     """
     Plant overview — single function, four or five internal queries.
     Returns everything for the plant overview page stat cards,
@@ -1016,7 +1021,9 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
         meter_is_live = bool(grid_live)          # grid meter liveness drives meter.status
         energy_today = _query_meter_today_energy(query_api, bucket, meter_site_id, meter_id)
         inv_data, inv_last, inv_status, inv_times = _query_inverter_status(query_api, bucket, site_id, inverter_ids)
-        inv_today_by_device = _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids)
+        inv_today_by_device = _query_inverters_today_energy(
+            query_api, bucket, site_id, inverter_ids, register_ids=register_inverter_ids
+        )
 
         weather_fields = {}
         weather_time   = None
@@ -1303,68 +1310,104 @@ def get_plant_power_trend(bucket, site_id, meter_id, weather_device_id=None, dat
 # ── Inverter Overview Queries ──────────────────────────────────────────────────
 
 
-def _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids):
+def _query_inverters_today_energy(query_api, bucket, site_id, inverter_ids, register_ids=None):
     """
-    Internal: today's generation per inverter, derived the same way as the
-    meter — last minus first of energy_total_kwh (lifetime counter) since
-    IST midnight. Replaces energy_daily_kwh on sites where that field isn't
-    populated. Grouped by device so N inverters cost one query pair, not N.
+    Internal: today's generation per inverter. Per-device source (Device.energy_today_source):
+      COUNTER  → last − first of energy_total_kwh since IST midnight.
+      REGISTER → last() of the inverter's own energy_today_kw since
+                 IST midnight + INVERTER_TODAY_REGISTER_GRACE_SECONDS.
+    Mixed sites are fine — each group runs only if it has devices.
 
-    Returns { device_id: energy_kwh_today }. Missing/incomplete pairs are
-    omitted from the dict (caller should .get(id, 0.0)).
+    Returns { device_id: energy_kwh_today }. Missing devices are omitted
+    (caller should .get(id, 0.0)).
     """
-    start = get_ist_midnight_utc()
-    device_filter = ' or '.join(
-        [f'r.device == "{d}"' for d in inverter_ids]
-    )
+    register_ids = set(register_ids or [])
+    counter_ids  = [d for d in inverter_ids if d not in register_ids]
+    reg_ids      = [d for d in inverter_ids if d in register_ids]
 
-    flux_first = f'''
-        from(bucket: "{bucket}")
-            |> range(start: {start})
-            |> filter(fn: (r) => r._measurement == "solar_data")
-            |> filter(fn: (r) => r.site == "{site_id}")
-            |> filter(fn: (r) => {device_filter})
-            |> filter(fn: (r) => r._field == "energy_total_kwh")
-            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-            |> group(columns: ["device"])
-            |> first()
-    '''
-
-    flux_last = f'''
-        from(bucket: "{bucket}")
-            |> range(start: {start})
-            |> filter(fn: (r) => r._measurement == "solar_data")
-            |> filter(fn: (r) => r.site == "{site_id}")
-            |> filter(fn: (r) => {device_filter})
-            |> filter(fn: (r) => r._field == "energy_total_kwh")
-            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-            |> group(columns: ["device"])
-            |> last()
-    '''
-
-    first_vals = {}
-    last_vals  = {}
-
-    tables = query_api.query(flux_first, org=INFLUX_ORG)
-    for table in tables:
-        for record in table.records:
-            first_vals[record.values.get('device')] = record.get_value()
-
-    tables = query_api.query(flux_last, org=INFLUX_ORG)
-    for table in tables:
-        for record in table.records:
-            last_vals[record.values.get('device')] = record.get_value()
-
+    start  = get_ist_midnight_utc()
     result = {}
-    for device_id in inverter_ids:
-        f = first_vals.get(device_id)
-        l = last_vals.get(device_id)
-        if f is not None and l is not None:
-            result[device_id] = round(l - f, 3)
+
+    # ── COUNTER inverters: last − first of the lifetime counter ──
+    if counter_ids:
+        device_filter = ' or '.join([f'r.device == "{d}"' for d in counter_ids])
+
+        flux_first = f'''
+            from(bucket: "{bucket}")
+                |> range(start: {start})
+                |> filter(fn: (r) => r._measurement == "solar_data")
+                |> filter(fn: (r) => r.site == "{site_id}")
+                |> filter(fn: (r) => {device_filter})
+                |> filter(fn: (r) => r._field == "energy_total_kwh")
+                |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+                |> group(columns: ["device"])
+                |> first()
+        '''
+
+        flux_last = f'''
+            from(bucket: "{bucket}")
+                |> range(start: {start})
+                |> filter(fn: (r) => r._measurement == "solar_data")
+                |> filter(fn: (r) => r.site == "{site_id}")
+                |> filter(fn: (r) => {device_filter})
+                |> filter(fn: (r) => r._field == "energy_total_kwh")
+                |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+                |> group(columns: ["device"])
+                |> last()
+        '''
+
+        first_vals = {}
+        last_vals  = {}
+
+        for table in query_api.query(flux_first, org=INFLUX_ORG):
+            for record in table.records:
+                first_vals[record.values.get('device')] = record.get_value()
+
+        for table in query_api.query(flux_last, org=INFLUX_ORG):
+            for record in table.records:
+                last_vals[record.values.get('device')] = record.get_value()
+
+        for device_id in counter_ids:
+            f = first_vals.get(device_id)
+            l = last_vals.get(device_id)
+            if f is not None and l is not None:
+                result[device_id] = round(l - f, 3)
+
+    # ── REGISTER inverters: the inverter's own energy_today_kw ──
+    if reg_ids:
+        reg_start_dt = (
+            datetime.strptime(start, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            + timedelta(seconds=INVERTER_TODAY_REGISTER_GRACE_SECONDS)
+        )
+        # Inside the grace window the range would start in the future (Flux
+        # errors) — skip; register inverters report no value until it passes.
+        if datetime.now(timezone.utc) > reg_start_dt:
+            reg_start     = reg_start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            device_filter = ' or '.join([f'r.device == "{d}"' for d in reg_ids])
+
+            flux_reg = f'''
+                from(bucket: "{bucket}")
+                    |> range(start: {reg_start})
+                    |> filter(fn: (r) => r._measurement == "solar_data")
+                    |> filter(fn: (r) => r.site == "{site_id}")
+                    |> filter(fn: (r) => {device_filter})
+                    |> filter(fn: (r) => r._field == "energy_today_kw")
+                    |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+                    |> group(columns: ["device"])
+                    |> last()
+            '''
+
+            for table in query_api.query(flux_reg, org=INFLUX_ORG):
+                for record in table.records:
+                    device = record.values.get('device')
+                    value  = record.get_value()
+                    if device is not None and value is not None:
+                        result[device] = round(value, 3)
 
     return result
 
-def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None):
+
+def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None, dc_capacity_kw=None, ac_capacity_kw=None, register_inverter_ids=None):
     """
     Fetches all live inverter data in one query.
     Returns summary (totals) + per inverter breakdown.
@@ -1425,7 +1468,7 @@ def get_inverter_overview(bucket, site_id, inverter_ids, weather_device_id=None,
             weather_is_live = bool(weather_fields)
 
         daily_energy_by_device = _query_inverters_today_energy(
-            query_api, bucket, site_id, inverter_ids
+            query_api, bucket, site_id, inverter_ids, register_ids=register_inverter_ids
         )
 
 
@@ -1667,7 +1710,7 @@ def get_inverter_power_trend(bucket, site_id, inverter_ids, weather_device_id=No
 
 # ── Inverter Detail Page Queries ──────────────────────────────────────────────
 
-def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_capacity_per_inverter=None):
+def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_capacity_per_inverter=None, energy_today_register=False):
     """
     Daily energy is derived (last-minus-first of energy_total_kwh since IST
     midnight), not read from energy_daily_kwh — see get_inverter_overview.
@@ -1719,7 +1762,8 @@ def get_inverter_detail(bucket, site_id, device_id, weather_device_id=None, dc_c
             weather_is_live = bool(weather_fields)
 
         daily_energy_by_device = _query_inverters_today_energy(
-            query_api, bucket, site_id, [device_id]
+            query_api, bucket, site_id, [device_id],
+            register_ids=[device_id] if energy_today_register else None,
         )
 
         client.close()
@@ -2789,65 +2833,111 @@ def _query_meter_peak_power_for_day(query_api, bucket, site_id, meter_id, start,
     return None, None
 
 
-def _query_inverter_daily_sum_for_day(query_api, bucket, site_id, inverter_ids, start, end):
+def _query_inverter_daily_sum_for_day(query_api, bucket, site_id, inverter_ids, start, end, register_ids=None):
     """
-    Internal: summed inverter generation for the given IST day, derived as
-    last - first of each inverter's energy_total_kwh (lifetime counter), then
-    summed. Matches the meter's daily-energy derivation and the live
-    get_inverter_daily_energy. energy_daily_kwh is retired (self-resetting,
-    absent on newer sites — reading it gave 0/N online + 0 sum).
+    Internal: summed inverter generation for the given IST day. Per-device
+    source (Device.energy_today_source), same split as the live
+    _query_inverters_today_energy:
+      COUNTER  → last − first of energy_total_kwh over the day.
+      REGISTER → last() of energy_today_kw over
+                 [start + INVERTER_TODAY_REGISTER_GRACE_SECONDS, end).
+                 The window ends at next IST midnight, before the ~00:01
+                 reset, so last() is the day's final total.
 
-    Server-side first()/last() per device group — same weight class as the
-    meter's single-day query, not the raw series.
-
-    "Reporting" = the inverter communicated energy_total_kwh at all that day
-    (has both a first and last point). A real 0 kWh washout still counts as
-    online; only a silent inverter is 0/N. Cross-check figure vs the meter,
-    not the authoritative daily energy.
+    "Reporting" = the inverter communicated its energy field that day
+    (COUNTER: both a first and last point; REGISTER: any point). A real
+    0 kWh washout still counts as online; only a silent inverter is 0/N.
+    Cross-check figure vs the meter, not the authoritative daily energy.
 
     Returns (total_kwh, count_reporting).
     """
-    device_filter = ' or '.join(f'r.device == "{d}"' for d in inverter_ids)
-
-    flux = f'''
-        base = from(bucket: "{bucket}")
-            |> range(start: {start}, stop: {end})
-            |> filter(fn: (r) => r._measurement == "solar_data")
-            |> filter(fn: (r) => r.site == "{site_id}")
-            |> filter(fn: (r) => {device_filter})
-            |> filter(fn: (r) => r._field == "energy_total_kwh")
-            |> filter(fn: (r) => exists r._value)
-            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
-
-        base |> first() |> yield(name: "first")
-        base |> last()  |> yield(name: "last")
-    '''
-
-    tables = query_api.query(flux, org=INFLUX_ORG)
-
-    firsts = {}
-    lasts  = {}
-    for table in tables:
-        for record in table.records:
-            result = record.values.get('result')   # 'first' / 'last' (yield name)
-            device = record.values.get('device')
-            value  = record.get_value()
-            if value is None or device is None:
-                continue
-            if result == 'first':
-                firsts[device] = value
-            elif result == 'last':
-                lasts[device] = value
+    register_ids = set(register_ids or [])
+    counter_ids  = [d for d in inverter_ids if d not in register_ids]
+    reg_ids      = [d for d in inverter_ids if d in register_ids]
 
     total = 0.0
     count = 0
-    for device in inverter_ids:
-        if device in firsts and device in lasts:
-            count += 1                                        # communicated → online
-            total += max(0.0, lasts[device] - firsts[device])  # a day can't generate negative
+
+    # ── COUNTER inverters ──
+    if counter_ids:
+        device_filter = ' or '.join(f'r.device == "{d}"' for d in counter_ids)
+
+        flux = f'''
+            base = from(bucket: "{bucket}")
+                |> range(start: {start}, stop: {end})
+                |> filter(fn: (r) => r._measurement == "solar_data")
+                |> filter(fn: (r) => r.site == "{site_id}")
+                |> filter(fn: (r) => {device_filter})
+                |> filter(fn: (r) => r._field == "energy_total_kwh")
+                |> filter(fn: (r) => exists r._value)
+                |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+                |> filter(fn: (r) => r._value > 0.0)   // v13 Fix A: a live lifetime
+                //  counter is never 0; a night 0 latched by first() = whole odometer
+
+            base |> first() |> yield(name: "first")
+            base |> last()  |> yield(name: "last")
+        '''
+
+        firsts = {}
+        lasts  = {}
+        for table in query_api.query(flux, org=INFLUX_ORG):
+            for record in table.records:
+                result = record.values.get('result')   # 'first' / 'last' (yield name)
+                device = record.values.get('device')
+                value  = record.get_value()
+                if value is None or device is None:
+                    continue
+                if result == 'first':
+                    firsts[device] = value
+                elif result == 'last':
+                    lasts[device] = value
+
+        for device in counter_ids:
+            if device in firsts and device in lasts:
+                count += 1                                        # communicated → online
+                total += max(0.0, lasts[device] - firsts[device])  # a day can't generate negative
+
+    # ── REGISTER inverters ──
+    if reg_ids:
+        fmt          = '%Y-%m-%dT%H:%M:%SZ'
+        reg_start_dt = (
+            datetime.strptime(start, fmt).replace(tzinfo=timezone.utc)
+            + timedelta(seconds=INVERTER_TODAY_REGISTER_GRACE_SECONDS)
+        )
+        end_dt = datetime.strptime(end, fmt).replace(tzinfo=timezone.utc)
+
+        # Only possible when run for today inside the grace window — skip
+        # rather than send Flux an empty/inverted range.
+        if reg_start_dt < end_dt:
+            device_filter = ' or '.join(f'r.device == "{d}"' for d in reg_ids)
+
+            flux_reg = f'''
+                from(bucket: "{bucket}")
+                    |> range(start: {reg_start_dt.strftime(fmt)}, stop: {end})
+                    |> filter(fn: (r) => r._measurement == "solar_data")
+                    |> filter(fn: (r) => r.site == "{site_id}")
+                    |> filter(fn: (r) => {device_filter})
+                    |> filter(fn: (r) => r._field == "energy_today_kw")
+                    |> filter(fn: (r) => exists r._value)
+                    |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+                    |> group(columns: ["device"])
+                    |> last()
+            '''
+
+            reg_vals = {}
+            for table in query_api.query(flux_reg, org=INFLUX_ORG):
+                for record in table.records:
+                    device = record.values.get('device')
+                    value  = record.get_value()
+                    if device is not None and value is not None:
+                        reg_vals[device] = value
+
+            for device in reg_ids:
+                if device in reg_vals:
+                    count += 1
+                    total += max(0.0, reg_vals[device])
 
     return round(total, 3), count
-
 
 # Generation Start End (Optimize it later)
 
