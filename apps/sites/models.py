@@ -195,6 +195,10 @@ class Device(models.Model):
         ANNUNCIATOR     = 'ANNUNCIATOR',     'Annunciator'
         OTHER           = 'OTHER',          'Other'
 
+    class EnergyTodaySource(models.TextChoices):
+        COUNTER  = 'COUNTER',  'Counter (energy_total_kwh last / first)'
+        REGISTER = 'REGISTER', 'Register (energy_today_kw)'
+    
     site            = models.ForeignKey(
         Site,
         on_delete=models.PROTECT,
@@ -212,6 +216,18 @@ class Device(models.Model):
         max_digits=12, decimal_places=2, default=0,
         help_text='Manual correction added to raw meter lifetime energy reading '
     )
+
+    energy_today_source = models.CharField(
+        max_length=10,
+        choices=EnergyTodaySource.choices,
+        default=EnergyTodaySource.COUNTER,
+        help_text=(
+            "Inverters only. How today's energy is read: COUNTER derives it from "
+            "the lifetime counter since IST midnight; REGISTER reads the inverter's "
+            "own energy_today_kw. Switch back to COUNTER if the register misbehaves."
+        ),
+    )
+    
     class Meta:
         db_table = 'devices'
         constraints = [

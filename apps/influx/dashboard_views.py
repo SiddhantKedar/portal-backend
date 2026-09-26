@@ -156,6 +156,10 @@ class PlantOverviewView(TenantFilterMixin, APIView):
         grid_site_tag, grid_dev = grid_meter.influx_location if grid_meter else (None, None)
         name_map     = {d.influx_device_id: d.name for d in inverters}
         inverter_ids = list(name_map.keys())
+        register_inverter_ids = [
+            d.influx_device_id for d in inverters
+            if d.energy_today_source == Device.EnergyTodaySource.REGISTER
+        ]
         bucket       = site.customer.influx_bucket
 
         # Optional — not every site has a weather station yet, and an
@@ -190,6 +194,7 @@ class PlantOverviewView(TenantFilterMixin, APIView):
                 ac_capacity_kw     = site.ac_capacity_kw,
                 daily_generation_target_kwh = site.daily_generation_target_kwh,
                 target_cuf_pct = site.target_cuf_pct,
+                register_inverter_ids = register_inverter_ids,
             )
 
             # Attach human readable names

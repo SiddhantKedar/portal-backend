@@ -154,6 +154,11 @@ class Command(BaseCommand):
 
         inverter_ids = [d.influx_device_id for d in inverters]
 
+        register_inverter_ids = [
+            d.influx_device_id for d in inverters
+            if d.energy_today_source == Device.EnergyTodaySource.REGISTER
+        ]
+
         weather_device = Device.objects.filter(
             site=site, device_type='WEATHER_STATION', is_active=True
         ).first()
@@ -168,10 +173,9 @@ class Command(BaseCommand):
                 query_api, bucket, meter_site_tag, meter_dev, start, end
             )
 
-            inv_sum_kwh, inv_reporting_count = (None, None)
-            if inverter_ids:
-                inv_sum_kwh, inv_reporting_count = _query_inverter_daily_sum_for_day(
-                    query_api, bucket, site_id, inverter_ids, start, end   # plant — inverters
+            inv_sum_kwh, inv_reporting_count = _query_inverter_daily_sum_for_day(
+                    query_api, bucket, site_id, inverter_ids, start, end,   # plant — inverters
+                    register_ids=register_inverter_ids,
                 )
 
             poa_kwh_m2 = None
