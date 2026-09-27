@@ -265,9 +265,9 @@ class PlantPowerTrendView(TenantFilterMixin, APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        meter = site.get_grid_meter()
+        meter = site.get_reference_meter()
         if not meter:
-            return Response({'detail': 'No grid meter found'},
+            return Response({'detail': 'No reference meter found'},
                             status=status.HTTP_404_NOT_FOUND)
         meter_site_tag, meter_dev = meter.influx_location
         
