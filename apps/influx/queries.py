@@ -2503,6 +2503,83 @@ def _query_portfolio_logger(query_api, bucket, site_ids):
     return results
 
 
+def _query_portfolio_weather(query_api, bucket, site_weather_map):
+    """
+    POA today + station liveness for every weather station in a bucket, one call.
+    Mirrors Plant Overview exactly:
+      poa_kwh_m2     = integral of irradiation_inclined_wm2 since IST midnight
+                       (same as _query_poa_irradiation), Wh/m² → kWh/m², round 4.
+      weather_online = any weather field fresh within STALE_AFTER_SECONDS
+                       (same rule as _query_weather_live).
+    site_weather_map: { influx_site_id: weather_influx_device_id }  (plant's own site tag)
+    Returns: { influx_site_id: {'poa_kwh_m2': float, 'weather_online': bool} }
+
+    Resilient: any Influx error returns {} → caller treats every station as
+    offline, PR goes null, the portfolio stays up.
+    """
+    if not site_weather_map:
+        return {}
+
+    site_filter   = ' or '.join([f'r.site == "{s}"' for s in site_weather_map.keys()])
+    device_filter = ' or '.join([f'r.device == "{d}"' for d in set(site_weather_map.values())])
+    start         = get_ist_midnight_utc()
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => {site_filter})
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "irradiation_inclined_wm2")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> integral(unit: 1h)
+            |> yield(name: "poa")
+
+        from(bucket: "{bucket}")
+            |> range(start: -10m)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => {site_filter})
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) =>
+                r._field == "irradiation_inclined_wm2" or
+                r._field == "ambient_temp_c"           or
+                r._field == "module_temp_c"            or
+                r._field == "wind_speed_ms"            or
+                r._field == "wind_direction_deg"       or
+                r._field == "pressure_hpa"             or
+                r._field == "rain_mm"                  or
+                r._field == "humidity_pct"
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+            |> yield(name: "live")
+    '''
+
+    try:
+        tables = query_api.query(flux, org=INFLUX_ORG)
+    except Exception:
+        return {}
+
+    poa_wh = {}     # { (site_tag, device_tag): Wh/m² }
+    live   = set()  # { (site_tag, device_tag) } with any fresh field
+    for table in tables:
+        for record in table.records:
+            key = (record.values.get('site'), record.values.get('device'))
+            if record.values.get('result') == 'poa':
+                poa_wh.setdefault(key, record.get_value() or 0.0)
+            elif _is_fresh(record.get_time()):
+                live.add(key)
+
+    out = {}
+    for influx_site_id, device_id in site_weather_map.items():
+        key = (influx_site_id, device_id)
+        out[influx_site_id] = {
+            'poa_kwh_m2':     round(poa_wh.get(key, 0.0) / 1000.0, 4),
+            'weather_online': key in live,
+        }
+    return out
+
+
 def get_portfolio_overview(bucket_groups, include_energy=True):
     """
     Fires 2 Flux queries per bucket (live snapshot + energy today), or 1 per
@@ -2520,6 +2597,7 @@ def get_portfolio_overview(bucket_groups, include_energy=True):
             'pk_map':        { influx_site_id: site_pk },   # ALL sites in bucket
             'meter_map':     { influx_site_id: meter_influx_device_id },
             'inverters_map': { influx_site_id: [inv_influx_device_ids] },
+            'weather_map':   { influx_site_id: weather_influx_device_id },  # optional
         }
     }
     Returns keyed on Site.pk — NOT influx_site_id. influx_site_id is only unique
@@ -2546,6 +2624,11 @@ def get_portfolio_overview(bucket_groups, include_energy=True):
                 if include_energy else {}
             )
 
+            weather = (
+                _query_portfolio_weather(query_api, bucket, group.get('weather_map', {}))
+                if include_energy else {}
+            )
+
             logger = _query_portfolio_logger(query_api, bucket, site_ids)
 
             for influx_site_id, site_pk in group['pk_map'].items():
@@ -2560,6 +2643,7 @@ def get_portfolio_overview(bucket_groups, include_energy=True):
                     'energy_today_kwh': (
                         energy.get(influx_site_id, 0.0) if include_energy else None
                     ),
+                    **weather.get(influx_site_id, {'poa_kwh_m2': 0.0, 'weather_online': False}),
                     **logger.get(influx_site_id, {'logger_online': False, 'logger_last_seen': None}),
                 }
 
