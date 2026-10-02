@@ -56,6 +56,9 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
             return user.installer.name if user.installer_id else None
         if user.role == 'CUSTOMER':
             return user.customer.name if user.customer_id else None
+        if user.role == 'SITE_USER':
+            first = user.sites.select_related('customer').first()
+            return first.customer.name if first else None
         return 'All Customers'
 
     def _empty_response(self, user, include_energy=True):

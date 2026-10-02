@@ -60,7 +60,8 @@ class User(AbstractBaseUser, PermissionsMixin):
         related_name='users'
     )
 
-    # Linke to a single site - set ONLY if role is SITE_USER
+    # LEGACY — single site, read ONLY by the daily WhatsApp job on the VM.
+    # Portal code uses `sites`. Dropped once the WhatsApp runs are stopped.
     site = models.ForeignKey(
         'sites.Site',
         on_delete=models.SET_NULL,
@@ -68,6 +69,15 @@ class User(AbstractBaseUser, PermissionsMixin):
         blank=True,
         related_name='users'
     )
+
+    # Sites a SITE_USER can see — one or more, all under ONE customer
+    # (enforced in the admin form; M2M can't be validated in clean()).
+    sites = models.ManyToManyField(
+       'sites.Site',
+       blank=True,
+       related_name='site_users',
+       limit_choices_to={'site_type': 'GENERATION'},
+   )
 
     # Standard Django fields
     is_active  = models.BooleanField(default=True)
@@ -110,22 +120,22 @@ class User(AbstractBaseUser, PermissionsMixin):
     
     def clean(self):
         super().clean()
+        # `sites` (M2M) is validated in the admin form (SitesValidationMixin) —
+        # the model can't see the form's selection.
         if self.role == self.Role.ADMIN:
-            if self.installer_id or self.customer_id or self.site_id:
-                raise ValidationError('Admin users must not have an installer, customer, or site assigned.')
+            if self.installer_id or self.customer_id:
+                raise ValidationError('Admin users must not have an installer or customer assigned.')
         elif self.role == self.Role.INSTALLER:
             if not self.installer_id:
                 raise ValidationError('Installer users must have an installer assigned.')
-            if self.customer_id or self.site_id:
-                raise ValidationError('Installer users must not have a customer or site assigned.')
+            if self.customer_id:
+                raise ValidationError('Installer users must not have a customer assigned.')
         elif self.role == self.Role.CUSTOMER:
             if not self.customer_id:
                 raise ValidationError('Customer users must have a customer assigned.')
-            if self.installer_id or self.site_id:
-                raise ValidationError('Customer users must not have an installer or site assigned.')
+            if self.installer_id:
+                raise ValidationError('Customer users must not have an installer assigned.')
         elif self.role == self.Role.SITE_USER:
-            if not self.site_id:
-                raise ValidationError('Site users must have a site assigned.')
             if self.installer_id or self.customer_id:
                 raise ValidationError('Site users must not have an installer or customer assigned.')
 
