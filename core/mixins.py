@@ -13,7 +13,7 @@ class TenantFilterMixin:
                  (customers are derived through those sites)
     CUSTOMER   → sees only their own sites/devices
 
-    SITE_USER → sees only one assigned site (+ its substation) and its devices
+    SITE_USER → sees only assigned site (+ their substation) and their devices
     """
 
     def get_filtered_customers(self):
@@ -33,10 +33,8 @@ class TenantFilterMixin:
             ).distinct()
 
         if user.role == 'SITE_USER':
-            if not user.site_id:
-                return Customer.objects.none()
-            # The customer that owns this user's single site.
-            return Customer.objects.filter(sites__id=user.site_id).distinct()
+            # The customer that owns this user's sites (one customer by design).
+            return Customer.objects.filter(sites__in=user.sites.all()).distinct()
 
         # Customer role cannot list all customers
         return Customer.objects.none()
@@ -58,12 +56,11 @@ class TenantFilterMixin:
             return Site.objects.filter(customer=user.customer)
 
         if user.role == 'SITE_USER':
-            if not user.site_id:
-                return Site.objects.none()
-            # Assigned site + its substation child (parent_site → assigned site),
-            # so the linked-substation meter overview stays visible.
+            # Assigned sites + their substation children (parent_site → an
+            # assigned site), so linked-substation meter overviews stay visible.
+            site_ids = user.sites.values('pk')
             return Site.objects.filter(
-                Q(pk=user.site_id) | Q(parent_site_id=user.site_id)
+                Q(pk__in=site_ids) | Q(parent_site_id__in=site_ids)
             )
 
         return Site.objects.none()
@@ -84,10 +81,9 @@ class TenantFilterMixin:
             return Device.objects.filter(site__customer=user.customer)
 
         if user.role == 'SITE_USER':
-            if not user.site_id:
-                return Device.objects.none()
+            site_ids = user.sites.values('pk')
             return Device.objects.filter(
-                Q(site_id=user.site_id) | Q(site__parent_site_id=user.site_id)
+                Q(site_id__in=site_ids) | Q(site__parent_site_id__in=site_ids)
             )
 
         return Device.objects.none()

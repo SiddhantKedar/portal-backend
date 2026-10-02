@@ -51,7 +51,7 @@ class LoginView(APIView):
         elif user.role == 'CUSTOMER':
             sites = Site.objects.filter(customer=user.customer, site_type='GENERATION')
         elif user.role == 'SITE_USER':
-            sites = Site.objects.filter(pk=user.site_id, site_type='GENERATION')
+            sites = Site.objects.filter(pk__in=user.sites.values('pk'), site_type='GENERATION')
         else:
             sites = Site.objects.none()
 
