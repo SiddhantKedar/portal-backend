@@ -36,6 +36,10 @@ EXPORT_THRESHOLD_KW = -1.0
 # yesterday's final value must never be read as today's.
 INVERTER_TODAY_REGISTER_GRACE_SECONDS = 300
 
+# REGISTER-mode inverters: inverter clocks drift vs IST — some reset their
+# daily register a minute or two BEFORE IST midnight. End the day's register
+# read this many seconds early so last() is the day's total, not the reset 0.
+INVERTER_TODAY_REGISTER_END_GUARD_SECONDS = 900
 
 # -------- Inverter status mapping ----------
 # Canonical inverter_status codes (single-value, per handoff spec):
@@ -2988,16 +2992,18 @@ def _query_inverter_daily_sum_for_day(query_api, bucket, site_id, inverter_ids, 
             datetime.strptime(start, fmt).replace(tzinfo=timezone.utc)
             + timedelta(seconds=INVERTER_TODAY_REGISTER_GRACE_SECONDS)
         )
-        end_dt = datetime.strptime(end, fmt).replace(tzinfo=timezone.utc)
+        reg_stop_dt = (
+            datetime.strptime(end, fmt).replace(tzinfo=timezone.utc)
+            - timedelta(seconds=INVERTER_TODAY_REGISTER_END_GUARD_SECONDS)
+        )
 
-        # Only possible when run for today inside the grace window — skip
-        # rather than send Flux an empty/inverted range.
-        if reg_start_dt < end_dt:
+        # Skip rather than send Flux an empty/inverted range.
+        if reg_start_dt < reg_stop_dt:
             device_filter = ' or '.join(f'r.device == "{d}"' for d in reg_ids)
 
             flux_reg = f'''
                 from(bucket: "{bucket}")
-                    |> range(start: {reg_start_dt.strftime(fmt)}, stop: {end})
+                    |> range(start: {reg_start_dt.strftime(fmt)}, stop: {reg_stop_dt.strftime(fmt)})
                     |> filter(fn: (r) => r._measurement == "solar_data")
                     |> filter(fn: (r) => r.site == "{site_id}")
                     |> filter(fn: (r) => {device_filter})
