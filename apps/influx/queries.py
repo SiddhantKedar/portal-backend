@@ -2316,6 +2316,7 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
             |> filter(fn: (r) =>
                 r._field == "active_power_total_kw" or
                 r._field == "ac_active_power_kw"  or
+                r._field == "energy_total_kwh"    or
                 r._field == "inverter_status"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
@@ -2367,14 +2368,15 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
         # Household sites have no meter: power is the sum of the fresh inverters'
         # AC power, and last_updated is the newest inverter record.
         household = influx_site_id in household_sites
-        inv_power = 0.0
+        inv_power = None   # stays None until an inverter actually reports power
         for inv_id in inv_ids:
             inv_rec = raw.get((influx_site_id, inv_id))
             if not inv_rec:
                 continue
             online += 1
             if household:
-                inv_power += inv_rec.get('ac_active_power_kw') or 0.0
+                if inv_rec.get('ac_active_power_kw') is not None:
+                    inv_power = (inv_power or 0.0) + inv_rec['ac_active_power_kw']
                 if last_time is None or inv_rec['_time'] > last_time:
                     last_time = inv_rec['_time']
             # online-gated last-known status from the wider window
@@ -2383,7 +2385,10 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
             states[_INVERTER_STATE_KEYS.get(code, 'other')] += 1
 
         results[influx_site_id] = {
-            'active_power_kw':  round(inv_power, 2) if household else active_power_kw,
+            'active_power_kw': (
+                (round(inv_power, 2) if inv_power is not None else None)
+                if household else active_power_kw
+            ),
             'meter_online':     None if household else bool(meter_rec),   # None = no meter by design
             'inverters_online': online,
             'inverters_total':  len(inv_ids),
