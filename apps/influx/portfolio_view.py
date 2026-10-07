@@ -248,7 +248,7 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                 if energy_month_kwh is not None:
                     total_energy_month += energy_month_kwh
 
-                total_active_power     += active_power
+                total_active_power     += active_power or 0.0
                 if energy_today is not None:
                     total_energy_today += energy_today
                 total_ac_capacity      += float(site.ac_capacity_kw or 0)
