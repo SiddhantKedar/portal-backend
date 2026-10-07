@@ -11,6 +11,7 @@ from .analytics_views import AnalyticsMetricsListView, AnalyticsView
 from .portfolio_view import PortfolioOverviewView
 from .weather_views import WeatherSnapshotView
 from .faults_views import InverterFaultsView
+from .household_views import HouseholdOverviewView
 
 urlpatterns = [
     path('dashboard/daily-energy/', DailyEnergyView.as_view(),        name='daily-energy'),
@@ -50,5 +51,8 @@ urlpatterns = [
 
     # Inverter faults / status-timeline page
     path('faults/', InverterFaultsView.as_view()),
+
+    # Household (inverter-only) site page
+    path('household/overview/', HouseholdOverviewView.as_view()),
 
 ]

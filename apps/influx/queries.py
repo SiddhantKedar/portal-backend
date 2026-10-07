@@ -2270,7 +2270,7 @@ def get_analytics_data(bucket, site_id, series_map, date_str=None, interval_minu
 
 # ── Portfolio Overview Queries ─────────────────────────────────────────────────
 
-def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, site_inverters_map):
+def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, site_inverters_map, household_sites=()):
     """
     Live active power per meter + inverter online count per site, one query.
     site_ids:           [influx_site_id] — ALL sites in this bucket, including meterless ones
@@ -2364,19 +2364,27 @@ def _query_portfolio_live_snapshot(query_api, bucket, site_ids, site_meter_map, 
         online = 0
         states = {'running': 0, 'stopped': 0, 'standby': 0,
                   'warning': 0, 'fault': 0, 'other': 0}
+        # Household sites have no meter: power is the sum of the fresh inverters'
+        # AC power, and last_updated is the newest inverter record.
+        household = influx_site_id in household_sites
+        inv_power = 0.0
         for inv_id in inv_ids:
             inv_rec = raw.get((influx_site_id, inv_id))
             if not inv_rec:
                 continue
             online += 1
+            if household:
+                inv_power += inv_rec.get('ac_active_power_kw') or 0.0
+                if last_time is None or inv_rec['_time'] > last_time:
+                    last_time = inv_rec['_time']
             # online-gated last-known status from the wider window
             raw_status = status_raw.get((influx_site_id, inv_id))
             code = int(round(raw_status)) if raw_status is not None else None
             states[_INVERTER_STATE_KEYS.get(code, 'other')] += 1
 
         results[influx_site_id] = {
-            'active_power_kw':  active_power_kw,
-            'meter_online':     bool(meter_rec),
+            'active_power_kw':  round(inv_power, 2) if household else active_power_kw,
+            'meter_online':     None if household else bool(meter_rec),   # None = no meter by design
             'inverters_online': online,
             'inverters_total':  len(inv_ids),
             'states':           states,
@@ -2454,7 +2462,109 @@ def _query_portfolio_energy_today(query_api, bucket, site_meter_map):
     }
 
 
-def _query_portfolio_logger(query_api, bucket, site_ids):
+def _query_portfolio_inverter_energy_today(query_api, bucket, site_inverters_map, site_register_map):
+    """
+    Energy today for HOUSEHOLD sites in this bucket = sum of the site's inverters.
+    Bulk mirror of _query_inverters_today_energy - keep in lockstep:
+      COUNTER   last - first of energy_total_kwh since IST midnight.
+      REGISTER  last() of energy_today_kw since IST midnight + grace.
+    site_inverters_map: { influx_site_id: [inverter_influx_device_ids] }  household sites only
+    site_register_map:  { influx_site_id: [device ids set to REGISTER] }
+    Returns: { influx_site_id: energy_today_kwh }. A site whose inverters have
+    reported nothing today is omitted (caller defaults it, same as the meter path).
+    """
+    counter_keys  = set()   # (site, device)
+    register_keys = set()
+    for site_id, inv_ids in site_inverters_map.items():
+        reg = set(site_register_map.get(site_id, []))
+        for d in inv_ids:
+            (register_keys if d in reg else counter_keys).add((site_id, d))
+
+    start      = get_ist_midnight_utc()
+    ist_offset = '5h30m'
+    per_device = {}         # { (site, device): kWh }
+
+    if counter_keys:
+        site_filter   = ' or '.join([f'r.site == "{s}"' for s in {k[0] for k in counter_keys}])
+        device_filter = ' or '.join([f'r.device == "{d}"' for d in {k[1] for k in counter_keys}])
+
+        # _value > 0 drops a spurious zero counter read, which would otherwise
+        # become "first" and inflate the day by the whole lifetime total.
+        flux = f'''
+        import "timezone"
+
+        option location = timezone.fixed(offset: {ist_offset})
+
+        day_first = from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => {site_filter})
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "energy_total_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> filter(fn: (r) => r._value > 0.0)
+            |> aggregateWindow(every: 24h, fn: first, createEmpty: false, timeSrc: "_start")
+            |> map(fn: (r) => ({{r with _field: "v_first"}}))
+
+        day_last = from(bucket: "{bucket}")
+            |> range(start: {start})
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => {site_filter})
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) => r._field == "energy_total_kwh")
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> filter(fn: (r) => r._value > 0.0)
+            |> aggregateWindow(every: 24h, fn: last, createEmpty: false, timeSrc: "_start")
+            |> map(fn: (r) => ({{r with _field: "v_last"}}))
+
+        union(tables: [day_first, day_last])
+            |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+            |> map(fn: (r) => ({{r with _value: r.v_last - r.v_first}}))
+        '''
+
+        for table in query_api.query(flux, org=INFLUX_ORG):
+            for record in table.records:
+                key = (record.values.get('site'), record.values.get('device'))
+                # The filters are site-OR x device-OR, so a REGISTER inverter that
+                # shares a device id with another site's COUNTER one can come back.
+                if key in counter_keys and record.get_value() is not None:
+                    per_device[key] = record.get_value()
+
+    if register_keys:
+        reg_start_dt = (
+            datetime.strptime(start, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            + timedelta(seconds=INVERTER_TODAY_REGISTER_GRACE_SECONDS)
+        )
+        # Inside the grace window the range would start in the future (Flux errors).
+        if datetime.now(timezone.utc) > reg_start_dt:
+            reg_start     = reg_start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            site_filter   = ' or '.join([f'r.site == "{s}"' for s in {k[0] for k in register_keys}])
+            device_filter = ' or '.join([f'r.device == "{d}"' for d in {k[1] for k in register_keys}])
+
+            flux_reg = f'''
+                from(bucket: "{bucket}")
+                    |> range(start: {reg_start})
+                    |> filter(fn: (r) => r._measurement == "solar_data")
+                    |> filter(fn: (r) => {site_filter})
+                    |> filter(fn: (r) => {device_filter})
+                    |> filter(fn: (r) => r._field == "energy_today_kw")
+                    |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+                    |> last()
+            '''
+
+            for table in query_api.query(flux_reg, org=INFLUX_ORG):
+                for record in table.records:
+                    key = (record.values.get('site'), record.values.get('device'))
+                    if key in register_keys and record.get_value() is not None:
+                        per_device[key] = record.get_value()
+
+    totals = {}
+    for (site_id, _device), kwh in per_device.items():
+        totals[site_id] = totals.get(site_id, 0.0) + kwh
+    return {site_id: round(v, 2) for site_id, v in totals.items()}
+
+
+def _query_portfolio_logger(query_api, bucket, site_ids, logger_tags=None):
     """
     Data-logger heartbeat for every site in a bucket, one query.
       logger_online    = last heartbeat within STALE_AFTER_SECONDS (120s).
@@ -2472,7 +2582,13 @@ def _query_portfolio_logger(query_api, bucket, site_ids):
 
     offline = {sid: {'logger_online': False, 'logger_last_seen': None} for sid in site_ids}
 
-    site_filter = ' or '.join([f'r.site == "{s}"' for s in site_ids])
+    # logger_tags: { influx_site_id: site tag its heartbeat is published under }.
+    # Household sites share one gateway, whose heartbeat carries the client id as
+    # its site tag. Sites not in the map use their own site id, as before.
+    logger_tags = logger_tags or {}
+    site_filter = ' or '.join(
+        [f'r.site == "{s}"' for s in {logger_tags.get(sid, sid) for sid in site_ids}]
+    )
 
     flux = f'''
         from(bucket: "{bucket}")
@@ -2499,7 +2615,7 @@ def _query_portfolio_logger(query_api, bucket, site_ids):
 
     results = {}
     for sid in site_ids:
-        t = last_by_site.get(sid)
+        t = last_by_site.get(logger_tags.get(sid, sid))
         results[sid] = {
             'logger_online':    _is_fresh(t),
             'logger_last_seen': t.isoformat() if t else None,
@@ -2620,20 +2736,32 @@ def get_portfolio_overview(bucket_groups, include_energy=True):
         for bucket, group in bucket_groups.items():
             site_ids = list(group['pk_map'].keys())
 
+            household = group.get('household', set())
+
             live = _query_portfolio_live_snapshot(
-                query_api, bucket, site_ids, group['meter_map'], group['inverters_map']
+                query_api, bucket, site_ids, group['meter_map'], group['inverters_map'],
+                household
             )
             energy = (
                 _query_portfolio_energy_today(query_api, bucket, group['meter_map'])
                 if include_energy else {}
             )
+            # Household sites: energy today from their inverters, not a meter.
+            if include_energy and household:
+                energy.update(_query_portfolio_inverter_energy_today(
+                    query_api, bucket,
+                    {sid: group['inverters_map'].get(sid, []) for sid in household},
+                    group.get('register_map', {}),
+                ))
 
             weather = (
                 _query_portfolio_weather(query_api, bucket, group.get('weather_map', {}))
                 if include_energy else {}
             )
 
-            logger = _query_portfolio_logger(query_api, bucket, site_ids)
+            logger = _query_portfolio_logger(
+                query_api, bucket, site_ids, group.get('logger_tags')
+            )
 
             for influx_site_id, site_pk in group['pk_map'].items():
                 results[site_pk] = {
@@ -3525,3 +3653,166 @@ def get_annunciator_history(bucket, site_id, device_ids, date_str=None):
     except Exception as e:
         client.close()
         raise e
+    
+
+# ─── Household Overview Query ────────────────────────────────────────────────
+def get_household_overview(bucket, site_id, inverter_ids, logger_site_id, ac_capacity_kw=None, register_inverter_ids=None):
+    """
+    Household (inverter-only) site page - one function, three internal queries.
+    No meter anywhere: site power and energy are sums over the site's inverters.
+
+    Real-data rule: a value the inverter did not send is None, never 0.0, so the
+    frontend renders "-". E.g. these inverters stop sending ac_active_power_kw at
+    night while still reporting energy and frequency - power is None, the inverter
+    stays online. Site totals are the sum of the inverters that reported, and None
+    when none did.
+
+    logger_site_id: site tag the gateway heartbeat is published under (the client
+    id for household sites - one gateway serves every owner of a building).
+
+    Online / state rules mirror get_inverter_overview: any fresh field = online;
+    inverter_status is read from the wider status window and shown only when online.
+    """
+    client    = get_influx_client()
+    query_api = client.query_api()
+
+    device_filter = ' or '.join([f'r.device == "{d}"' for d in inverter_ids])
+
+    flux = f'''
+        from(bucket: "{bucket}")
+            |> range(start: -6h)
+            |> filter(fn: (r) => r._measurement == "solar_data")
+            |> filter(fn: (r) => r.site == "{site_id}")
+            |> filter(fn: (r) => {device_filter})
+            |> filter(fn: (r) =>
+                r._field == "ac_active_power_kw"      or
+                r._field == "energy_total_kwh"        or
+                r._field == "inverter_status"         or
+                r._field == "grid_voltage_a_v"        or
+                r._field == "ac_current_phase_a"      or
+                r._field == "grid_frequency_hz"       or
+                r._field == "ac_power_factor"         or
+                r._field == "internal_temp_c"         or
+                r._field == "dc_input_power_kw"       or
+                r._field == "inverter_efficiency_pct" 
+            )
+            |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
+            |> last()
+    '''
+
+    try:
+        tables = query_api.query(flux, org=INFLUX_ORG)
+        today_by_device = _query_inverters_today_energy(
+            query_api, bucket, site_id, inverter_ids, register_ids=register_inverter_ids
+        )
+        logger_online, logger_time = _query_data_logger(query_api, bucket, logger_site_id)
+    except Exception as e:
+        raise Exception(f'Household overview query failed: {str(e)}')
+    finally:
+        client.close()
+
+    device_data   = {}   # fresh only - live values, drives online/offline
+    device_total  = {}   # last-known lifetime counter, kept while offline
+    device_status = {}
+    device_times  = {}
+
+    for table in tables:
+        for record in table.records:
+            device = record.values.get('device')
+            field  = record.get_field()
+            value  = record.get_value()
+            time   = record.get_time()
+
+            if field == 'energy_total_kwh':
+                device_total[device] = value
+
+            if field == 'inverter_status':
+                if _is_status_recent(time):
+                    device_status[device] = value
+                continue
+
+            if not _is_fresh(time):
+                continue
+
+            device_data.setdefault(device, {})[field] = value
+            if device not in device_times or time > device_times[device]:
+                device_times[device] = time
+
+    def pick(fields, name, digits):
+        v = fields.get(name)
+        return round(v, digits) if v is not None else None
+
+    inverter_list = []
+    online_count  = 0
+    state_counts  = {'running': 0, 'stopped': 0, 'standby': 0,
+                     'warning': 0, 'fault': 0, 'other': 0}
+
+    for device_id in inverter_ids:
+        fields    = device_data.get(device_id, {})
+        t         = device_times.get(device_id)
+        is_online = bool(fields)
+
+        inverter_status = None
+        if is_online:
+            online_count += 1
+            raw_status = device_status.get(device_id)
+            if raw_status is not None:
+                code = int(round(raw_status))
+                inverter_status = {'code': code, 'label': _inverter_status_label(code)}
+            state_counts[_INVERTER_STATE_KEYS.get(
+                inverter_status['code'] if inverter_status else None, 'other'
+            )] += 1
+
+
+        inverter_list.append({
+            'device_id':               device_id,
+            'ac_active_power_kw':      pick(fields, 'ac_active_power_kw', 2),
+            'energy_daily_kwh':        pick(today_by_device, device_id, 3),
+            'energy_total_kwh':        pick(device_total, device_id, 2),
+            'grid_voltage_a_v':        pick(fields, 'grid_voltage_a_v', 1),
+            'ac_current_phase_a':      pick(fields, 'ac_current_phase_a', 2),
+            'grid_frequency_hz':       pick(fields, 'grid_frequency_hz', 2),
+            'ac_power_factor':         pick(fields, 'ac_power_factor', 2),
+            'internal_temp_c':         pick(fields, 'internal_temp_c', 1),
+            'dc_input_power_kw':       pick(fields, 'dc_input_power_kw', 2),
+            'inverter_efficiency_pct': pick(fields, 'inverter_efficiency_pct', 1),
+            'status':          'online' if is_online else 'offline',
+            'inverter_status': inverter_status,
+            'last_updated':    t.isoformat() if t else None,
+        })
+
+    # Site totals: sum of the inverters that reported; None when none did.
+    powers = [i['ac_active_power_kw'] for i in inverter_list if i['ac_active_power_kw'] is not None]
+    todays = [i['energy_daily_kwh']   for i in inverter_list if i['energy_daily_kwh']   is not None]
+    totals = [i['energy_total_kwh']   for i in inverter_list if i['energy_total_kwh']   is not None]
+
+    energy_today = round(sum(todays), 2) if todays else None
+
+    return {
+        'last_updated': max(
+            (t.isoformat() for t in device_times.values() if t), default=None
+        ),
+        'summary': {
+            'active_power_kw':  round(sum(powers), 2) if powers else None,
+            'energy_today_kwh': energy_today,
+            'energy_month_kwh': None,   # not built for household yet (backlog)
+            'energy_total_kwh': round(sum(totals), 2) if totals else None,
+            'ac_capacity_kw':   float(ac_capacity_kw) if ac_capacity_kw else None,
+            'cuf_pct': (
+                round((energy_today / (float(ac_capacity_kw) * 24)) * 100, 2)
+                if ac_capacity_kw and energy_today is not None else None
+            ),
+            'co2_avoided_today_kg': (
+                round(energy_today * CO2_AVOIDED_FACTOR_KG_PER_KWH, 2)
+                if energy_today is not None else None
+            ),
+            'inverters_online': online_count,
+            'inverters_total':  len(inverter_ids),
+            'states':           state_counts,
+        },
+        'data_logger': {
+            'status':    'online' if logger_online else 'offline',
+            'last_seen': logger_time.isoformat() if logger_time else None,
+        },
+        'inverters': inverter_list,
+    }
