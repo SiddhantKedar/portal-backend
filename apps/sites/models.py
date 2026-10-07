@@ -38,6 +38,11 @@ class Site(models.Model):
         GENERATION  = 'GENERATION', 'Generation Plant'
         SUBSTATION  = 'SUBSTATION', 'Substation / GSS'
         OTHER       = 'OTHER',      'Other'
+
+    class Category(models.TextChoices):
+        UTILITY   = 'UTILITY',   'Utility'
+        HOUSEHOLD = 'HOUSEHOLD', 'Household'
+
     customer    = models.ForeignKey(
         Customer,
         on_delete=models.PROTECT,
@@ -55,6 +60,18 @@ class Site(models.Model):
         choices=SiteType.choices,
         default=SiteType.GENERATION 
     )
+
+    category = models.CharField(
+        max_length=20,
+        choices=Category.choices,
+        default=Category.UTILITY,
+        help_text=(
+            "What kind of plant this is. UTILITY = meter-based plant (meter, "
+            "inverters, weather station). HOUSEHOLD = inverter-only rooftop "
+            "site, power and energy come from the inverters."
+        )
+    )
+
 
     parent_site = models.ForeignKey(
         'self',

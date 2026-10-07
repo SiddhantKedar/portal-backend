@@ -73,6 +73,8 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                 'cuf_pct': None,
                 'sites_online':           0,
                 'sites_total':            0,
+                'household_sites_online': 0,
+                'household_sites_total':  0,
                 'inverters_online':       0,
                 'inverters_total':        0,
                 'loggers_online':         0,
@@ -123,8 +125,11 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
             for pk, m in ref_meters.items() if m
         }
         inverters_by_pk = {}
+        register_by_pk  = {}
         for inv in inverters:
             inverters_by_pk.setdefault(inv.site_id, []).append(inv.influx_device_id)
+            if inv.energy_today_source == Device.EnergyTodaySource.REGISTER:
+                register_by_pk.setdefault(inv.site_id, []).append(inv.influx_device_id)
 
         # Group by bucket — one Flux query pair per bucket. influx_site_id is safe
         # as a key *inside* a bucket (unique per customer), which is why pk_map
@@ -133,15 +138,24 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
         for site in sites:
             bucket = site.customer.influx_bucket
             group = bucket_groups.setdefault(
-                bucket, {'pk_map': {}, 'meter_map': {}, 'inverters_map': {},'weather_map': {}}
+                bucket, {'pk_map': {}, 'meter_map': {}, 'inverters_map': {}, 'weather_map': {},
+                         'household': set(), 'register_map': {}, 'logger_tags': {}}
             )
             iid = site.influx_site_id
+            household = site.category == Site.Category.HOUSEHOLD
             group['pk_map'][iid] = site.pk
-            if site.pk in meter_by_pk:
+            if site.pk in meter_by_pk and not household:
                 group['meter_map'][iid] = meter_by_pk[site.pk]   # now a (tag, device) pair
             group['inverters_map'][iid] = inverters_by_pk.get(site.pk, [])
             if site.pk in weather_by_pk:
                 group['weather_map'][iid] = weather_by_pk[site.pk]
+            if household:
+                group['household'].add(iid)
+                group['register_map'][iid] = register_by_pk.get(site.pk, [])
+                # One gateway serves every household site of this customer; its
+                # heartbeat is published with the client id as the site tag.
+                if site.customer.influx_client_id:
+                    group['logger_tags'][iid] = site.customer.influx_client_id
         try:
             influx_results = get_portfolio_overview(bucket_groups, include_energy=include_energy)
         except Exception as e:
@@ -173,8 +187,11 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
         total_ac_capacity      = 0.0
         cuf_energy_sum   = 0.0   # energy today of sites that have AC capacity
         cuf_capacity_sum = 0.0   # their AC capacity
-        sites_online           = 0
-        loggers_online_total   = 0
+        sites_online           = 0      # utility sites only
+        household_sites_online = 0
+        household_sites_total  = 0
+        logger_keys            = set()  # distinct loggers; household sites share one
+        logger_keys_online     = set()
         inverters_online_total = 0
         inverters_total_total  = 0
         inverters_online_total = 0
@@ -206,7 +223,7 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                 performance_ratio_pct = None
                 cuf_pct               = None
                 if include_energy:
-                    if prior_month is not None:
+                    if prior_month is not None and site.category != Site.Category.HOUSEHOLD:
                         energy_month_kwh = round(
                             prior_month.get(site.pk, 0.0) + (energy_today or 0.0), 2
                         )
@@ -235,18 +252,31 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                 if energy_today is not None:
                     total_energy_today += energy_today
                 total_ac_capacity      += float(site.ac_capacity_kw or 0)
-                if logger_online:
+                household = site.category == Site.Category.HOUSEHOLD
+                if household:
+                    household_sites_total += 1
+                    if logger_online:
+                        household_sites_online += 1
+                elif logger_online:
                     sites_online += 1
                 inverters_online_total += inv_online
                 inverters_total_total  += inv_total
+                # Household sites of one customer share a gateway, so its logger
+                # is counted once. Same tag rule as logger_tags above.
+                logger_key = (
+                    site.customer.influx_bucket,
+                    (site.customer.influx_client_id if household else None) or site.influx_site_id,
+                )
+                logger_keys.add(logger_key)
                 if logger_online:
-                    loggers_online_total += 1
+                    logger_keys_online.add(logger_key)
                 for k, v in inv_states.items():
                     states_total[k] += v
 
                 site_cards.append({
                     'site_id':          site.pk,
                     'site_name':        site.name,
+                    'category':         site.category,
                     'location':         site.location,
                     'installer_name':   site.installer.name if site.installer_id else None,
                     'active_power_kw':  active_power,
@@ -291,11 +321,13 @@ class PortfolioOverviewView(TenantFilterMixin, APIView):
                 ),
                 'ac_capacity_kw':         round(total_ac_capacity, 2),
                 'sites_online':           sites_online,
-                'sites_total':            len(sites),
+                'sites_total':            len(sites) - household_sites_total,
+                'household_sites_online': household_sites_online,
+                'household_sites_total':  household_sites_total,
                 'inverters_online':       inverters_online_total,
                 'inverters_total':        inverters_total_total,
-                'loggers_online':         loggers_online_total,
-                'loggers_total':          len(sites),
+                'loggers_online':         len(logger_keys_online),
+                'loggers_total':          len(logger_keys),
                 'states':                 states_total
             },
             'customers': customers_list,
