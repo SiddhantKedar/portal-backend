@@ -43,9 +43,9 @@ class UserAdmin(BaseUserAdmin):
     add_form = UserAdminCreationForm
 
     list_display  = ('email', 'full_name', 'role', 'installer', 'customer', 'sites_list',
-                     'whatsapp_number', 'is_active')
+                     'whatsapp_number', 'phone_number', 'is_active')
     list_filter   = ('role', 'is_active', 'is_staff', 'installer', 'customer')
-    search_fields = ('email', 'first_name', 'last_name', 'whatsapp_number',
+    search_fields = ('email', 'first_name', 'last_name', 'whatsapp_number', 'phone_number',
                      'installer__name', 'customer__name', 'sites__name')
     ordering      = ('email',)
 
@@ -57,7 +57,7 @@ class UserAdmin(BaseUserAdmin):
 
     fieldsets = (
         (None,            {'fields': ('email', 'password')}),
-        ('Personal',      {'fields': ('first_name', 'last_name', 'whatsapp_number')}),
+        ('Personal',      {'fields': ('first_name', 'last_name', 'phone_number', 'whatsapp_number')}),
         ('Role & Access', {'fields': ('role', 'installer', 'customer', 'sites')}),
         ('Permissions',   {'fields': ('is_active', 'is_staff', 'is_superuser')}),
         ('Meta',          {'fields': ('date_joined',)}),
@@ -66,7 +66,7 @@ class UserAdmin(BaseUserAdmin):
     add_fieldsets = (
         (None, {
             'classes': ('wide',),
-            'fields': ('email', 'first_name', 'last_name', 'whatsapp_number', 'role',
+            'fields': ('email', 'first_name', 'last_name','phone_number', 'whatsapp_number', 'role',
                        'installer', 'customer', 'sites', 'password1', 'password2'),
         }),
     )

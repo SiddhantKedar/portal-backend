@@ -23,6 +23,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = (
             'id',
             'email',
+            'phone_number',
             'first_name',
             'last_name',
             'full_name',
@@ -89,7 +90,9 @@ class UserSerializer(serializers.ModelSerializer):
 
 class LoginSerializer(serializers.Serializer):
     """
-    Validates login input - just email and password.
+    Validates login input - number or email and password.
     """
-    email    = serializers.EmailField()
+    # Carries the user's email OR their 10-digit phone number. The key stays
+    # `email` so existing clients keep working.
+    email    = serializers.CharField()
     password = serializers.CharField(write_only=True)

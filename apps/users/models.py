@@ -39,6 +39,15 @@ class User(AbstractBaseUser, PermissionsMixin):
         help_text="WhatsApp number with country code, no '+', e.g. 918424882274. "
                 "Null = no WhatsApp delivery.",
     )
+
+    # Optional login number: 10 digits, no country code. A user can log in with
+    # this OR their email. Kept separate from whatsapp_number on purpose, because
+    # filling that one switches on WhatsApp delivery.
+    phone_number = models.CharField(
+        max_length=10, unique=True, null=True, blank=True,
+        help_text="10-digit mobile number the user can log in with instead of email. "
+                  "Leave empty for email-only login.",
+    )
     role       = models.CharField(max_length=20, choices=Role.choices)
 
     # Link to installer company — only set if role is INSTALLER or CUSTOMER
@@ -120,6 +129,14 @@ class User(AbstractBaseUser, PermissionsMixin):
     
     def clean(self):
         super().clean()
+        # Empty is stored as NULL, never '': the field is unique, and two users
+        # with '' would collide. NULLs do not.
+        self.phone_number = (self.phone_number or '').strip() or None
+        if self.phone_number and not (
+            self.phone_number.isascii() and self.phone_number.isdigit()
+            and len(self.phone_number) == 10
+        ):
+            raise ValidationError('Phone number must be exactly 10 digits.')
         # `sites` (M2M) is validated in the admin form (SitesValidationMixin) —
         # the model can't see the form's selection.
         if self.role == self.Role.ADMIN:
