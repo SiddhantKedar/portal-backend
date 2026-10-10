@@ -7,6 +7,9 @@ from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 
+import re
+
+from .models import User
 from .serializers import UserSerializer, LoginSerializer
 from apps.sites.models import Site
 from apps.sites.serializers import SiteListSerializer
@@ -23,6 +26,20 @@ class LoginView(APIView):
 
         email    = serializer.validated_data['email']
         password = serializer.validated_data['password']
+
+        # Phone login: no '@' means it may be a phone number. Strip spaces and
+        # dashes, +91 and a leading 0; if 10 digits remain and a user has that
+        # number, log in as that user. Anything else goes down the email path.
+        if '@' not in email:
+            digits = re.sub(r'\D', '', email)
+            if len(digits) == 12 and digits.startswith('91'):
+                digits = digits[2:]
+            elif len(digits) == 11 and digits.startswith('0'):
+                digits = digits[1:]
+            if len(digits) == 10:
+                phone_user = User.objects.filter(phone_number=digits).first()
+                if phone_user:
+                    email = phone_user.email
 
         user = authenticate(request, username=email, password=password)
 

@@ -51,6 +51,25 @@ _INVERTER_STATUS_LABELS = {0: 'Stopped', 1: 'Running', 2: 'Standby', 4: 'Warning
 # Absent/unrecognized status → 'other', so the six always sum to `online`.
 _INVERTER_STATE_KEYS = {0: 'stopped', 1: 'running', 2: 'standby', 4: 'warning', 8: 'fault'}
 
+# Standard inverter faults: (bit of `fault_code`, code, label, category).
+# Mirrors GENERIC_FAULT_BITS + CATEGORY_MEMBERS in the gateway Lua - keep in
+# lockstep. Never renumber a bit; only append new ones.
+_INVERTER_FAULTS = [
+    (0,  'grid_overvoltage',  'Grid overvoltage',  'grid'),
+    (1,  'grid_undervoltage', 'Grid undervoltage', 'grid'),
+    (2,  'grid_frequency',    'Grid frequency',    'grid'),
+    (3,  'grid_fault',        'Grid fault',        'grid'),
+    (4,  'dc_overvoltage',    'DC overvoltage',    'electrical'),
+    (5,  'ac_overcurrent',    'AC overcurrent',    'electrical'),
+    (6,  'ground_fault',      'Ground fault',      'electrical'),
+    (7,  'leakage_current',   'Leakage current',   'electrical'),
+    (8,  'arc_fault',         'Arc fault',         'electrical'),
+    (9,  'over_temperature',  'Over temperature',  'thermal'),
+    (10, 'insulation_fault',  'Insulation fault',  'electrical'),
+    (11, 'internal_fault',    'Internal fault',    'hardware'),
+    (12, 'generic_fault',     'Unspecified fault', 'generic'),
+]
+
 
 def _inverter_status_label(code):
     return _INVERTER_STATUS_LABELS.get(code, 'Unknown')
@@ -723,6 +742,7 @@ def _query_inverter_status(query_api, bucket, site_id, inverter_ids):
                 r._field == "ac_active_power_kw" or
                 r._field == "dc_input_power_kw" or
                 r._field == "energy_total_kwh" or
+                r._field == "fault_code" or
                 r._field == "inverter_status"
             )
             |> map(fn: (r) => ({{r with _value: float(v: r._value)}}))
@@ -1116,6 +1136,18 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 )
                 state_counts[key] += 1
 
+            # Live faults: decoded from a FRESH fault_code only, no history.
+            # None = offline or fault_code not published (site not mapped yet);
+            # [] = reporting, no fault. Independent of inverter_status.
+            faults = None
+            if is_online and fields.get('fault_code') is not None:
+                word = int(round(fields['fault_code']))
+                faults = [
+                    {'code': code, 'label': label, 'category': category}
+                    for bit, code, label, category in _INVERTER_FAULTS
+                    if (word >> bit) & 1
+                ]
+
             # e_today: calculated last−first (not the retired energy_daily_kwh).
             # e_total: last-known lifetime, ungated → persists while offline.
             daily_gen = abs(inv_today_by_device.get(device_id, 0.0))
@@ -1128,6 +1160,7 @@ def get_plant_overview(bucket, site_id, inverter_ids, meter_id, weather_device_i
                 'total_gen_kwh':   round(total_gen, 2),
                 'status':          'online' if is_online else 'offline',
                 'inverter_status': inverter_status,
+                'faults':          faults,
                 'last_updated':    t.isoformat() if t else None,
             })
 
